@@ -8,9 +8,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -135,6 +137,13 @@ func networkChecker(hub *utils.WebSocketHub) {
 var currentNetworkStatus = "offline"
 
 func main() {
+	// Protect the process from supervisor interference
+	// Create a new process group to isolate from supervisor signals
+	if os.Getenv("UNDER_SUPERVISOR") != "" {
+		log.Println("SUPERVISOR_DEBUG: Running under supervisor, setting up signal protection...")
+		syscall.Setpgid(0, 0)
+	}
+
 	wsHub := utils.NewWebSocketHub()
 
 	btManager, err := bluetooth.NewBluetoothManager(wsHub)
@@ -783,6 +792,187 @@ func main() {
 
 	go networkChecker(wsHub)
 
+	// GET /media/status
+	http.HandleFunc("/media/status", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		state := btManager.GetMediaState()
+		connected := btManager.IsMediaConnected()
+
+		response := map[string]interface{}{
+			"connected": connected,
+			"state":     state,
+		}
+
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Error encoding response"})
+			return
+		}
+	}))
+
+	// POST /media/play
+	http.HandleFunc("/media/play", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		if err := btManager.SendMediaCommand("play", nil, nil); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send play command: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /media/pause
+	http.HandleFunc("/media/pause", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		if err := btManager.SendMediaCommand("pause", nil, nil); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send pause command: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /media/next
+	http.HandleFunc("/media/next", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		if err := btManager.SendMediaCommand("next", nil, nil); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send next command: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /media/previous
+	http.HandleFunc("/media/previous", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		if err := btManager.SendMediaCommand("previous", nil, nil); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send previous command: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /media/seek/{position_ms}
+	http.HandleFunc("/media/seek/", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		positionStr := strings.TrimPrefix(r.URL.Path, "/media/seek/")
+		position, err := strconv.Atoi(positionStr)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid position value"})
+			return
+		}
+
+		if err := btManager.SendMediaCommand("seek_to", &position, nil); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send seek command: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /media/volume/{percent}
+	http.HandleFunc("/media/volume/", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		volumeStr := strings.TrimPrefix(r.URL.Path, "/media/volume/")
+		volume, err := strconv.Atoi(volumeStr)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid volume value"})
+			return
+		}
+
+		if volume < 0 || volume > 100 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Volume must be between 0 and 100"})
+			return
+		}
+
+		if err := btManager.SendMediaCommand("set_volume", nil, &volume); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send volume command: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /media/simulate - for testing purposes
+	http.HandleFunc("/media/simulate", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		var req struct {
+			Artist    string `json:"artist"`
+			Track     string `json:"track"`
+			IsPlaying bool   `json:"is_playing"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid request body"})
+			return
+		}
+
+		if mediaClient := btManager.GetMediaClient(); mediaClient != nil {
+			mediaClient.SimulateStateUpdate(req.Artist, req.Track, req.IsPlaying)
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
 	// GET /network/status
 	http.HandleFunc("/network/status", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
@@ -797,10 +987,225 @@ func main() {
 		json.NewEncoder(w).Encode(response)
 	}))
 
+	// GET /bluetooth/profiles/{address}
+	http.HandleFunc("/bluetooth/profiles/", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		address := strings.TrimPrefix(r.URL.Path, "/bluetooth/profiles/")
+		if address == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth address is required"})
+			return
+		}
+
+		profileManager := btManager.GetProfileManager()
+		if profileManager == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Profile manager not available"})
+			return
+		}
+
+		config := profileManager.GetProfileConfiguration(address)
+		response := utils.ProfileStatusResponse{
+			DeviceAddress: address,
+			Profiles:      config.Profiles,
+			LastUpdated:   time.Now().Unix(),
+		}
+
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Error encoding response"})
+			return
+		}
+	}))
+
+	// POST /bluetooth/profiles/update
+	http.HandleFunc("/bluetooth/profiles/update", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		var req utils.ProfileUpdateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid request body: " + err.Error()})
+			return
+		}
+
+		profileManager := btManager.GetProfileManager()
+		if profileManager == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Profile manager not available"})
+			return
+		}
+
+		if err := profileManager.UpdateProfile(req); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to update profile: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /bluetooth/profiles/connect
+	http.HandleFunc("/bluetooth/profiles/connect", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		var req utils.ProfileConnectionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid request body: " + err.Error()})
+			return
+		}
+
+		profileManager := btManager.GetProfileManager()
+		if profileManager == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Profile manager not available"})
+			return
+		}
+
+		if err := profileManager.ConnectProfile(req); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to connect profile: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /bluetooth/profiles/disconnect/{address}/{uuid}
+	http.HandleFunc("/bluetooth/profiles/disconnect/", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/bluetooth/profiles/disconnect/"), "/")
+		if len(pathParts) != 2 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Address and profile UUID are required"})
+			return
+		}
+
+		address := pathParts[0]
+		profileUUID := pathParts[1]
+
+		profileManager := btManager.GetProfileManager()
+		if profileManager == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Profile manager not available"})
+			return
+		}
+
+		if err := profileManager.DisconnectProfile(address, profileUUID); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to disconnect profile: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// GET /bluetooth/profiles/detect/{address}
+	http.HandleFunc("/bluetooth/profiles/detect/", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		address := strings.TrimPrefix(r.URL.Path, "/bluetooth/profiles/detect/")
+		if address == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth address is required"})
+			return
+		}
+
+		profileManager := btManager.GetProfileManager()
+		if profileManager == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Profile manager not available"})
+			return
+		}
+
+		supportedProfiles, err := profileManager.DetectDeviceProfiles(address)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to detect profiles: " + err.Error()})
+			return
+		}
+
+		response := map[string]interface{}{
+			"device_address":      address,
+			"supported_profiles":  supportedProfiles,
+			"profile_count":       len(supportedProfiles),
+		}
+
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Error encoding response"})
+			return
+		}
+	}))
+
+	// GET /bluetooth/profiles/logs
+	http.HandleFunc("/bluetooth/profiles/logs", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		limit := 100 // Default limit
+		if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+			if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+				limit = parsedLimit
+			}
+		}
+
+		profileManager := btManager.GetProfileManager()
+		if profileManager == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Profile manager not available"})
+			return
+		}
+
+		logs := profileManager.GetProfileLogs(limit)
+		response := map[string]interface{}{
+			"logs":  logs,
+			"count": len(logs),
+		}
+
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Error encoding response"})
+			return
+		}
+	}))
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "5000"
 	}
+
+	// Simple signal protection - ignore signals that might interfere with SPP
+	signal.Ignore(syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGHUP, syscall.SIGPIPE)
 
 	log.Printf("Server starting on :%s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/vishvananda/netlink"
@@ -23,6 +24,8 @@ type BluetoothManager struct {
 	pairingRequests    chan utils.PairingRequest
 	wsHub              *utils.WebSocketHub
 	pendingDisconnects sync.Map
+	mediaClient        *MediaClient
+	profileManager     *ProfileManager
 }
 
 func NewBluetoothManager(wsHub *utils.WebSocketHub) (*BluetoothManager, error) {
@@ -57,6 +60,11 @@ func NewBluetoothManager(wsHub *utils.WebSocketHub) (*BluetoothManager, error) {
 
 	manager.monitorDisconnects()
 	manager.monitorNetworkInterfaces()
+
+	manager.mediaClient = NewMediaClient(manager, wsHub)
+	go manager.initializeMediaClient()
+
+	manager.profileManager = NewProfileManager(manager, wsHub)
 
 	return manager, nil
 }
@@ -442,4 +450,49 @@ func (m *BluetoothManager) DisconnectDevice(address string) error {
 	}
 
 	return nil
+}
+
+func (m *BluetoothManager) initializeMediaClient() {
+	log.Println("🚀 MediaClient: Starting initialization loop...")
+
+	for {
+		log.Println("🔄 MediaClient: Attempting discovery and connection...")
+		if err := m.mediaClient.DiscoverAndConnect(); err != nil {
+			log.Printf("❌ MediaClient: Connection failed: %v", err)
+			log.Println("⏰ MediaClient: Retrying in 30 seconds...")
+			time.Sleep(30 * time.Second)
+			continue
+		}
+		log.Println("✅ MediaClient: Successfully connected! Exiting initialization loop.")
+		break
+	}
+}
+
+func (m *BluetoothManager) GetMediaClient() *MediaClient {
+	return m.mediaClient
+}
+
+func (m *BluetoothManager) SendMediaCommand(command string, valueMs *int, valuePercent *int) error {
+	if m.mediaClient == nil {
+		return fmt.Errorf("media client not initialized")
+	}
+	return m.mediaClient.SendCommand(command, valueMs, valuePercent)
+}
+
+func (m *BluetoothManager) GetMediaState() *utils.MediaStateUpdate {
+	if m.mediaClient == nil {
+		return nil
+	}
+	return m.mediaClient.GetCurrentState()
+}
+
+func (m *BluetoothManager) IsMediaConnected() bool {
+	if m.mediaClient == nil {
+		return false
+	}
+	return m.mediaClient.IsConnected()
+}
+
+func (m *BluetoothManager) GetProfileManager() *ProfileManager {
+	return m.profileManager
 }
