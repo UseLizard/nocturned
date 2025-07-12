@@ -116,7 +116,7 @@ func (pm *ProfileManager) GetDefaultProfiles() map[string]utils.BluetoothProfile
 			Description: "Network Access Point - Internet tethering via Bluetooth",
 			Category:    CATEGORY_DATA,
 			State:       PROFILE_STATE_DISABLED,
-			Enabled:     true,
+			Enabled:     false,
 			AutoConnect: false,
 			Priority:    60,
 		},

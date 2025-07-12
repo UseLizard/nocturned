@@ -3,7 +3,6 @@ package bluetooth
 import (
 	"fmt"
 	"log"
-	"net"
 	"os/exec"
 	"strings"
 	"sync"
@@ -301,28 +300,11 @@ func (m *BluetoothManager) ConnectNetwork(address string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	devicePath := formatDevicePath(m.adapter, address)
-	obj := m.conn.Object(BLUEZ_BUS_NAME, devicePath)
-
-	if err := obj.Call("org.bluez.Network1.Connect", 0, "nap").Err; err != nil {
-		return err
-	}
-
-	link, err := netlink.LinkByName("bnep0")
-	if err != nil || link.Attrs().Flags&net.FlagUp == 0 {
-		return fmt.Errorf("bnep0 interface is not up")
-	}
-
-	if m.wsHub != nil {
-		m.wsHub.Broadcast(utils.WebSocketEvent{
-			Type: "bluetooth/network/connect",
-			Payload: utils.NetworkConnectedPayload{
-				Address: address,
-			},
-		})
-	}
-
-	return nil
+	// NAP (Network Access Point) connections disabled to prevent automatic
+	// internet tethering. This prevents Android devices from enabling
+	// "Internet connection sharing" when pairing with Nocturne.
+	log.Printf("ConnectNetwork called for %s - NAP connections disabled", address)
+	return fmt.Errorf("network connections disabled - NAP profile not available")
 }
 
 func (m *BluetoothManager) GetDevices() ([]utils.BluetoothDeviceInfo, error) {
