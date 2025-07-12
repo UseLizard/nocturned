@@ -27,3 +27,6 @@ go.work.sum
 # Nix
 /result
 /nocturned
+
+# Backup directories
+bluetooth-backups/
