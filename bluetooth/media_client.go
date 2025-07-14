@@ -2,10 +2,14 @@ package bluetooth
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -33,7 +37,16 @@ const (
 	DISCOVERY_CLEANUP_DELAY = 200 * time.Millisecond // Faster cleanup between tests
 	CONNECTION_RETRY_DELAY  = 2 * time.Second    // Slightly longer delay for persistent connection
 	HEARTBEAT_INTERVAL      = 30 * time.Second
+	CHUNK_TIMEOUT           = 30 * time.Second
 )
+
+type AlbumArtTransfer struct {
+	Hash         string
+	TotalSize    int
+	TotalChunks  int
+	ReceivedData map[int]string // chunk_index -> data
+	StartTime    time.Time
+}
 
 type MediaClient struct {
 	connected         bool
@@ -46,6 +59,10 @@ type MediaClient struct {
 	stopChan          chan struct{}
 	sppConn           net.Conn
 	sppConnected      bool
+
+	// Album art chunking
+	chunkBuffer       map[string]*AlbumArtTransfer
+	chunkMutex        sync.Mutex
 
 	// RFCOMM socket fields
 	rfcommFd        int
@@ -67,9 +84,10 @@ type sockaddr_rc struct {
 
 func NewMediaClient(btManager *BluetoothManager, wsHub *utils.WebSocketHub) *MediaClient {
 	return &MediaClient{
-		btManager: btManager,
-		wsHub:     wsHub,
-		stopChan:  make(chan struct{}),
+		btManager:   btManager,
+		wsHub:       wsHub,
+		stopChan:    make(chan struct{}),
+		chunkBuffer: make(map[string]*AlbumArtTransfer),
 	}
 }
 
@@ -274,6 +292,15 @@ func (mc *MediaClient) handleIncomingData() {
 		mc.mu.Lock()
 		mc.lastActivity = time.Now()
 		mc.mu.Unlock()
+
+		// Try to parse as MediaCommand first (for album art)
+		var command utils.MediaCommand
+		if err := json.Unmarshal([]byte(data), &command); err == nil && command.Command != "" {
+			if command.Command == "album_art" {
+				mc.handleAlbumArtCommand(&command)
+				continue
+			}
+		}
 
 		// Parse state update from Android app
 		var stateUpdate utils.MediaStateUpdate
@@ -895,6 +922,9 @@ func (mc *MediaClient) monitorConnection() {
 				// Note: Not sending ping commands to avoid interfering with the connection
 				// NocturneCompanion will send state updates when media is active
 			}
+
+			// Clean up stale album art transfers
+			mc.cleanupStaleTransfers()
 		}
 	}
 }
@@ -945,6 +975,145 @@ func (mc *MediaClient) handleConnectionLoss() {
 
 	// Schedule reconnection attempt
 	go mc.attemptReconnect()
+}
+
+func (mc *MediaClient) handleAlbumArtCommand(command *utils.MediaCommand) {
+	mc.chunkMutex.Lock()
+	defer mc.chunkMutex.Unlock()
+
+	log.Printf("Received album art chunk: hash=%s, chunk=%d/%d, size=%d", 
+		command.Hash, command.ChunkIndex+1, command.TotalChunks, command.ChunkSize)
+	
+	// Check if file already exists (for efficiency)
+	albumArtDir := "/data/etc/nocturne/albumart"
+	filename := fmt.Sprintf("%s.jpg", command.Hash)
+	filePath := filepath.Join(albumArtDir, filename)
+	
+	if _, err := os.Stat(filePath); err == nil {
+		log.Printf("Album art already exists: %s", filename)
+		if mc.wsHub != nil {
+			mc.wsHub.Broadcast(utils.WebSocketEvent{
+				Type: "album_art_exists",
+				Payload: map[string]interface{}{
+					"hash":     command.Hash,
+					"filename": filename,
+					"path":     filePath,
+				},
+			})
+		}
+		// Clean up any partial transfer
+		delete(mc.chunkBuffer, command.Hash)
+		return
+	}
+
+	// Initialize transfer if this is the first chunk
+	transfer, exists := mc.chunkBuffer[command.Hash]
+	if !exists {
+		transfer = &AlbumArtTransfer{
+			Hash:         command.Hash,
+			TotalSize:    command.Size,
+			TotalChunks:  command.TotalChunks,
+			ReceivedData: make(map[int]string),
+			StartTime:    time.Now(),
+		}
+		mc.chunkBuffer[command.Hash] = transfer
+		log.Printf("Started new album art transfer: %s (%d chunks expected)", command.Hash, command.TotalChunks)
+	}
+
+	// Store the chunk data
+	transfer.ReceivedData[command.ChunkIndex] = command.Data
+	log.Printf("Stored chunk %d/%d for %s", command.ChunkIndex+1, command.TotalChunks, command.Hash)
+
+	// Check if we have all chunks
+	if len(transfer.ReceivedData) == transfer.TotalChunks {
+		log.Printf("All chunks received for %s, assembling image...", command.Hash)
+		mc.assembleAndSaveAlbumArt(transfer, albumArtDir, filename, filePath)
+		delete(mc.chunkBuffer, command.Hash)
+	} else {
+		// Broadcast progress
+		if mc.wsHub != nil {
+			mc.wsHub.Broadcast(utils.WebSocketEvent{
+				Type: "album_art_progress",
+				Payload: map[string]interface{}{
+					"hash":              command.Hash,
+					"chunks_received":   len(transfer.ReceivedData),
+					"total_chunks":      transfer.TotalChunks,
+					"progress_percent":  float64(len(transfer.ReceivedData)) / float64(transfer.TotalChunks) * 100,
+				},
+			})
+		}
+	}
+}
+
+func (mc *MediaClient) assembleAndSaveAlbumArt(transfer *AlbumArtTransfer, albumArtDir, filename, filePath string) {
+	// Create album art directory if it doesn't exist
+	if err := os.MkdirAll(albumArtDir, 0755); err != nil {
+		log.Printf("Failed to create album art directory: %v", err)
+		return
+	}
+
+	// Assemble chunks in order
+	var base64Data strings.Builder
+	for i := 0; i < transfer.TotalChunks; i++ {
+		chunkData, exists := transfer.ReceivedData[i]
+		if !exists {
+			log.Printf("Missing chunk %d for %s", i, transfer.Hash)
+			return
+		}
+		base64Data.WriteString(chunkData)
+	}
+
+	// Decode base64 data
+	imageData, err := base64.StdEncoding.DecodeString(base64Data.String())
+	if err != nil {
+		log.Printf("Failed to decode album art data for %s: %v", transfer.Hash, err)
+		return
+	}
+
+	// Verify size matches
+	if len(imageData) != transfer.TotalSize {
+		log.Printf("Album art size mismatch for %s: expected %d, got %d", transfer.Hash, transfer.TotalSize, len(imageData))
+		return
+	}
+
+	// Save the file
+	if err := ioutil.WriteFile(filePath, imageData, 0644); err != nil {
+		log.Printf("Failed to save album art %s: %v", filename, err)
+		return
+	}
+
+	duration := time.Since(transfer.StartTime)
+	log.Printf("Album art saved successfully: %s (%d bytes, %d chunks, took %v)", 
+		filename, len(imageData), transfer.TotalChunks, duration)
+
+	// Broadcast successful album art save
+	if mc.wsHub != nil {
+		mc.wsHub.Broadcast(utils.WebSocketEvent{
+			Type: "album_art_received",
+			Payload: map[string]interface{}{
+				"hash":              transfer.Hash,
+				"filename":          filename,
+				"path":              filePath,
+				"size":              len(imageData),
+				"chunks":            transfer.TotalChunks,
+				"transfer_duration": duration.Milliseconds(),
+			},
+		})
+	}
+}
+
+// cleanupStaleTransfers removes album art transfers that have timed out
+func (mc *MediaClient) cleanupStaleTransfers() {
+	mc.chunkMutex.Lock()
+	defer mc.chunkMutex.Unlock()
+
+	now := time.Now()
+	for hash, transfer := range mc.chunkBuffer {
+		if now.Sub(transfer.StartTime) > CHUNK_TIMEOUT {
+			log.Printf("Cleaning up stale album art transfer: %s (started %v ago)", hash, now.Sub(transfer.StartTime))
+			delete(mc.chunkBuffer, hash)
+		}
+	}
 }
 
 // rfcommConn wraps a raw RFCOMM file descriptor to implement net.Conn interface

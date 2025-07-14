@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -943,6 +945,118 @@ func main() {
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /media/albumart - receive album art from companion app
+	http.HandleFunc("/media/albumart", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		// Parse multipart form to handle file upload
+		err := r.ParseMultipartForm(10 << 20) // 10 MB limit
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to parse multipart form: " + err.Error()})
+			return
+		}
+
+		file, header, err := r.FormFile("albumart")
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Album art file not found: " + err.Error()})
+			return
+		}
+		defer file.Close()
+
+		// Validate file type
+		if !strings.HasPrefix(header.Header.Get("Content-Type"), "image/") {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "File must be an image"})
+			return
+		}
+
+		// Read file content for hashing
+		fileContent, err := io.ReadAll(file)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to read file content: " + err.Error()})
+			return
+		}
+
+		// Calculate SHA-256 hash
+		hash := sha256.Sum256(fileContent)
+		hashStr := hex.EncodeToString(hash[:])
+
+		// Create album art directory if it doesn't exist
+		albumArtDir := "/data/etc/nocturne/albumart"
+		if err := os.MkdirAll(albumArtDir, 0755); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to create album art directory: " + err.Error()})
+			return
+		}
+
+		// Check if file with this hash already exists
+		extension := filepath.Ext(header.Filename)
+		if extension == "" {
+			// Default to .jpg if no extension
+			extension = ".jpg"
+		}
+		filename := fmt.Sprintf("%s%s", hashStr, extension)
+		filePath := filepath.Join(albumArtDir, filename)
+
+		// Check if file already exists
+		if _, err := os.Stat(filePath); err == nil {
+			// File already exists, return existing file info
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":       "exists",
+				"message":      "Album art already exists",
+				"filename":     filename,
+				"path":         filePath,
+				"hash":         hashStr,
+				"skip_reason":  "duplicate",
+			})
+			return
+		}
+
+		// Create the file
+		dst, err := os.Create(filePath)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to create album art file: " + err.Error()})
+			return
+		}
+		defer dst.Close()
+
+		// Write the file content
+		if _, err := dst.Write(fileContent); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to save album art: " + err.Error()})
+			return
+		}
+
+		// Broadcast album art update via WebSocket
+		wsHub.Broadcast(utils.WebSocketEvent{
+			Type: "album_art_updated",
+			Payload: map[string]interface{}{
+				"filename": filename,
+				"path":     filePath,
+				"hash":     hashStr,
+				"size":     len(fileContent),
+			},
+		})
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "uploaded",
+			"filename": filename,
+			"path":     filePath,
+			"hash":     hashStr,
+			"size":     len(fileContent),
+		})
 	}))
 
 	// POST /media/simulate - for testing purposes

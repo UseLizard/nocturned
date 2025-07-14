@@ -61,7 +61,10 @@ if ! sshpass -p "$CAR_THING_PASSWORD" ssh -o ConnectTimeout=5 -o StrictHostKeyCh
 fi
 echo_info "Connection successful"
 
-# Step 3: Remount filesystem as read-write
+# Step 3: Stop service and remount filesystem as read-write
+echo_info "Stopping nocturned service..."
+sshpass -p "$CAR_THING_PASSWORD" ssh root@$CAR_THING_IP "sv stop nocturned"
+
 echo_info "Remounting Car Thing filesystem as read-write..."
 sshpass -p "$CAR_THING_PASSWORD" ssh root@$CAR_THING_IP "mount -o remount,rw /"
 
@@ -76,10 +79,10 @@ sshpass -p "$CAR_THING_PASSWORD" scp $BINARY_NAME root@$CAR_THING_IP:/usr/local/
 echo_info "Making binaries executable..."
 sshpass -p "$CAR_THING_PASSWORD" ssh root@$CAR_THING_IP "chmod +x /usr/local/bin/$BINARY_NAME /usr/local/sbin/$BINARY_NAME"
 
-# Step 6: Restart the service
-echo_info "Restarting nocturned service..."
-RESTART_OUTPUT=$(sshpass -p "$CAR_THING_PASSWORD" ssh root@$CAR_THING_IP "sv restart nocturned" 2>&1)
-echo_info "Service restart output: $RESTART_OUTPUT"
+# Step 6: Start the service
+echo_info "Starting nocturned service..."
+START_OUTPUT=$(sshpass -p "$CAR_THING_PASSWORD" ssh root@$CAR_THING_IP "sv start nocturned" 2>&1)
+echo_info "Service start output: $START_OUTPUT"
 
 # Step 7: Verify service is running
 echo_info "Verifying service status..."

@@ -54,6 +54,12 @@ type MediaCommand struct {
 	Command      string `json:"command"`
 	ValueMs      *int   `json:"value_ms,omitempty"`
 	ValuePercent *int   `json:"value_percent,omitempty"`
+	Hash         string `json:"hash,omitempty"`
+	Size         int    `json:"size,omitempty"`
+	Data         string `json:"data,omitempty"`
+	ChunkIndex   int    `json:"chunk_index,omitempty"`
+	TotalChunks  int    `json:"total_chunks,omitempty"`
+	ChunkSize    int    `json:"chunk_size,omitempty"`
 }
 
 type MediaStateUpdate struct {
