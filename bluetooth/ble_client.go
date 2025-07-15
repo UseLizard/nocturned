@@ -74,47 +74,70 @@ func (bc *BleClient) DiscoverAndConnect() error {
 func (bc *BleClient) discoverNocturneCompanion() (string, error) {
 	log.Println("BLE_LOG: discoverNocturneCompanion called")
 
-	// Get paired devices first (like SPP client, but looking for BLE GATT capabilities)
+	// First check paired devices
 	devices, err := bc.btManager.GetDevices()
 	if err != nil {
 		log.Printf("BLE_LOG: GetDevices failed: %v", err)
 		return "", fmt.Errorf("failed to get bluetooth devices: %v", err)
 	}
 
-	log.Printf("🔍 BLE_LOG: Scanning %d devices for NocturneCompanion with GATT services...", len(devices))
+	log.Printf("🔍 BLE_LOG: Checking %d paired devices for NocturneCompanion...", len(devices))
 
-	// Look for devices with NocturneCompanion name that support GATT
-	// Note: BLE devices may not be "connected" when advertising
+	// Check paired devices first
 	for _, device := range devices {
+		log.Printf("BLE_LOG: Checking paired device: %s (%s)", device.Name, device.Address)
+		
+		// Check by name
 		if device.Name == DeviceName {
-			log.Printf("BLE_LOG: Found device with matching name: %s (%s) - Paired: %v, Connected: %v", 
-				device.Name, device.Address, device.Paired, device.Connected)
+			log.Printf("BLE_LOG: Found paired device with matching name: %s (%s)", 
+				device.Name, device.Address)
 			
-			// For BLE, we don't require the device to be connected yet
-			if device.Paired || bc.deviceSupportsGatt(device.Address) {
-				log.Printf("Found BLE NocturneCompanion device: %s (%s)", device.Name, device.Address)
-				
-				// Broadcast device found
-				if bc.wsHub != nil {
-					bc.wsHub.Broadcast(utils.WebSocketEvent{
-						Type: "media/ble_device_found",
-						Payload: map[string]interface{}{
-							"name":      device.Name,
-							"address":   device.Address,
-							"paired":    device.Paired,
-							"connected": device.Connected,
-							"timestamp": time.Now().Unix(),
-						},
-					})
-				}
-				
-				return device.Address, nil
+			// Broadcast device found
+			if bc.wsHub != nil {
+				bc.wsHub.Broadcast(utils.WebSocketEvent{
+					Type: "media/ble_device_found",
+					Payload: map[string]interface{}{
+						"name":      device.Name,
+						"address":   device.Address,
+						"paired":    true,
+						"source":    "paired_devices",
+						"timestamp": time.Now().Unix(),
+					},
+				})
 			}
+			
+			return device.Address, nil
 		}
 	}
 
-	log.Println("BLE_LOG: No connected NocturneCompanion device with GATT found")
-	return "", fmt.Errorf("no connected NocturneCompanion device with GATT found")
+	// If not found in paired devices, start BLE scanning
+	log.Println("BLE_LOG: No paired NocturneCompanion found, starting BLE scan...")
+	
+	// Start discovery
+	if err := bc.startDiscovery(); err != nil {
+		log.Printf("BLE_LOG: Failed to start discovery: %v", err)
+		return "", fmt.Errorf("failed to start discovery: %v", err)
+	}
+	
+	// Monitor for devices during scan
+	foundDevice := make(chan string, 1)
+	stopScan := make(chan struct{})
+	
+	go bc.monitorDiscoveredDevices(foundDevice, stopScan)
+	
+	// Wait for device discovery or timeout
+	select {
+	case address := <-foundDevice:
+		log.Printf("BLE_LOG: Found NocturneCompanion during scan: %s", address)
+		bc.stopDiscovery()
+		return address, nil
+		
+	case <-time.After(time.Duration(ScanTimeoutSec) * time.Second):
+		close(stopScan)
+		bc.stopDiscovery()
+		log.Println("BLE_LOG: Scan timeout - no NocturneCompanion device found")
+		return "", fmt.Errorf("no NocturneCompanion device found during scan")
+	}
 }
 
 func (bc *BleClient) deviceSupportsGatt(address string) bool {
@@ -143,6 +166,192 @@ func (bc *BleClient) deviceSupportsGatt(address string) bool {
 	
 	log.Printf("BLE_LOG: Device %s does not support GATT", address)
 	return false
+}
+
+func (bc *BleClient) deviceHasNordicUartService(address string) bool {
+	log.Printf("BLE_LOG: deviceHasNordicUartService called for address: %s", address)
+	devicePath := formatDevicePath(bc.btManager.adapter, address)
+	
+	// Get all managed objects to find services
+	objects := make(map[dbus.ObjectPath]map[string]map[string]dbus.Variant)
+	obj := bc.conn.Object(BLUEZ_BUS_NAME, "/")
+	if err := obj.Call("org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&objects); err != nil {
+		log.Printf("Failed to get managed objects for Nordic UART service check: %v", err)
+		return false
+	}
+
+	// Look for the Nordic UART Service UUID under this device
+	devicePathStr := string(devicePath)
+	for path, interfaces := range objects {
+		pathStr := string(path)
+		
+		// Check if this is a service under our device
+		if !strings.HasPrefix(pathStr, devicePathStr+"/service") {
+			continue
+		}
+		
+		// Check if it's a GATT service with our Nordic UART Service UUID
+		if svcIface, hasGattService := interfaces["org.bluez.GattService1"]; hasGattService {
+			if uuidVariant, ok := svcIface["UUID"]; ok {
+				uuid := uuidVariant.Value().(string)
+				if strings.EqualFold(uuid, NocturneServiceUUID) {
+					log.Printf("BLE_LOG: Device %s has Nordic UART Service", address)
+					return true
+				}
+			}
+		}
+	}
+	
+	log.Printf("BLE_LOG: Device %s does not have Nordic UART Service", address)
+	return false
+}
+
+func (bc *BleClient) startDiscovery() error {
+	log.Println("BLE_LOG: Starting BLE discovery...")
+	
+	// Set discovery filter for BLE devices
+	adapter := bc.conn.Object(BLUEZ_BUS_NAME, bc.btManager.adapter)
+	
+	// Set discovery filter to scan for BLE devices only
+	filter := map[string]interface{}{
+		"Transport": "le",  // Low Energy only
+		"DuplicateData": false,
+	}
+	
+	if err := adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0, filter).Err; err != nil {
+		log.Printf("BLE_LOG: Failed to set discovery filter: %v", err)
+		// Continue anyway, some adapters don't support filters
+	}
+	
+	// Start discovery
+	if err := adapter.Call("org.bluez.Adapter1.StartDiscovery", 0).Err; err != nil {
+		return fmt.Errorf("failed to start discovery: %v", err)
+	}
+	
+	log.Println("BLE_LOG: Discovery started successfully")
+	return nil
+}
+
+func (bc *BleClient) stopDiscovery() {
+	log.Println("BLE_LOG: Stopping BLE discovery...")
+	
+	adapter := bc.conn.Object(BLUEZ_BUS_NAME, bc.btManager.adapter)
+	if err := adapter.Call("org.bluez.Adapter1.StopDiscovery", 0).Err; err != nil {
+		log.Printf("BLE_LOG: Failed to stop discovery: %v", err)
+	}
+}
+
+func (bc *BleClient) monitorDiscoveredDevices(foundDevice chan<- string, stopScan <-chan struct{}) {
+	log.Println("BLE_LOG: Starting device discovery monitor...")
+	
+	// Poll for discovered devices
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	
+	checkedDevices := make(map[string]bool)
+	
+	for {
+		select {
+		case <-stopScan:
+			log.Println("BLE_LOG: Stopping device monitor")
+			return
+			
+		case <-ticker.C:
+			// Get all current devices
+			objects := make(map[dbus.ObjectPath]map[string]map[string]dbus.Variant)
+			obj := bc.conn.Object(BLUEZ_BUS_NAME, "/")
+			if err := obj.Call("org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&objects); err != nil {
+				log.Printf("BLE_LOG: Failed to get managed objects during scan: %v", err)
+				continue
+			}
+			
+			// Look for new devices
+			for path, interfaces := range objects {
+				pathStr := string(path)
+				
+				// Check if this is a device under our adapter
+				if !strings.HasPrefix(pathStr, string(bc.btManager.adapter)+"/dev_") {
+					continue
+				}
+				
+				// Get device interface
+				if deviceIface, hasDevice := interfaces[BLUEZ_DEVICE_INTERFACE]; hasDevice {
+					// Get device address
+					if addrVariant, ok := deviceIface["Address"]; ok {
+						address := addrVariant.Value().(string)
+						
+						// Skip if already checked
+						if checkedDevices[address] {
+							continue
+						}
+						checkedDevices[address] = true
+						
+						// Get device properties
+						var name string
+						var uuids []string
+						
+						if nameVariant, ok := deviceIface["Name"]; ok {
+							name = nameVariant.Value().(string)
+						}
+						
+						if uuidsVariant, ok := deviceIface["UUIDs"]; ok {
+							if uuidArray, ok := uuidsVariant.Value().([]string); ok {
+								uuids = uuidArray
+							}
+						}
+						
+						log.Printf("BLE_LOG: Discovered device: %s (%s) with %d UUIDs", name, address, len(uuids))
+						
+						// Check if this is our device by name
+						if name == DeviceName {
+							log.Printf("BLE_LOG: Found NocturneCompanion by name: %s", address)
+							
+							// Broadcast device found
+							if bc.wsHub != nil {
+								bc.wsHub.Broadcast(utils.WebSocketEvent{
+									Type: "media/ble_device_found",
+									Payload: map[string]interface{}{
+										"name":      name,
+										"address":   address,
+										"paired":    false,
+										"source":    "ble_scan",
+										"timestamp": time.Now().Unix(),
+									},
+								})
+							}
+							
+							foundDevice <- address
+							return
+						}
+						
+						// Check if device advertises our service UUID
+						for _, uuid := range uuids {
+							if strings.EqualFold(uuid, NocturneServiceUUID) {
+								log.Printf("BLE_LOG: Found device with Nordic UART Service: %s (%s)", name, address)
+								
+								// Broadcast device found
+								if bc.wsHub != nil {
+									bc.wsHub.Broadcast(utils.WebSocketEvent{
+										Type: "media/ble_device_found",
+										Payload: map[string]interface{}{
+											"name":      name,
+											"address":   address,
+											"paired":    false,
+											"source":    "ble_scan_service",
+											"timestamp": time.Now().Unix(),
+										},
+									})
+								}
+								
+								foundDevice <- address
+								return
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 func (bc *BleClient) connectToDevice() error {
@@ -183,24 +392,59 @@ func (bc *BleClient) connectBLE() error {
 	// Set device path
 	bc.devicePath = formatDevicePath(bc.btManager.adapter, bc.targetAddress)
 	
-	// Verify device is connected (it should already be connected from discovery)
+	// Get device object
 	obj := bc.conn.Object(BLUEZ_BUS_NAME, bc.devicePath)
+	
+	// Check if device exists
 	var props map[string]dbus.Variant
 	if err := obj.Call("org.freedesktop.DBus.Properties.GetAll", 0, BLUEZ_DEVICE_INTERFACE).Store(&props); err != nil {
 		return fmt.Errorf("failed to get device properties: %v", err)
 	}
 
-	if connected, ok := props["Connected"]; !ok || !connected.Value().(bool) {
+	// Check connection status
+	connected := false
+	if connectedProp, ok := props["Connected"]; ok {
+		connected = connectedProp.Value().(bool)
+	}
+
+	if !connected {
 		log.Println("BLE_LOG: Device not connected, attempting connection...")
+		
+		// For BLE devices, we need to connect first to discover GATT services
 		if err := obj.Call("org.bluez.Device1.Connect", 0).Err; err != nil {
-			return fmt.Errorf("failed to connect to device: %v", err)
+			// If already connecting, wait a bit
+			if strings.Contains(err.Error(), "InProgress") {
+				log.Println("BLE_LOG: Connection already in progress, waiting...")
+				time.Sleep(3 * time.Second)
+			} else {
+				return fmt.Errorf("failed to connect to device: %v", err)
+			}
 		}
 		
-		// Wait for connection
-		time.Sleep(2 * time.Second)
+		// Wait for connection to establish
+		maxAttempts := 10
+		for i := 0; i < maxAttempts; i++ {
+			time.Sleep(1 * time.Second)
+			
+			// Check connection status again
+			if err := obj.Call("org.freedesktop.DBus.Properties.Get", 0, BLUEZ_DEVICE_INTERFACE, "Connected").Store(&connected); err == nil && connected {
+				log.Println("BLE_LOG: Device connected successfully")
+				break
+			}
+			
+			if i == maxAttempts-1 {
+				return fmt.Errorf("timeout waiting for device connection")
+			}
+		}
+	} else {
+		log.Println("BLE_LOG: Device already connected")
 	}
 
 	bc.bleConnected = true
+
+	// Wait a bit for services to be resolved
+	log.Println("BLE_LOG: Waiting for GATT services to be resolved...")
+	time.Sleep(2 * time.Second)
 
 	// Discover and connect to GATT service
 	if err := bc.discoverGattService(); err != nil {
@@ -229,8 +473,27 @@ func (bc *BleClient) findDeviceByAddress(address string) (string, error) {
 func (bc *BleClient) discoverGattService() error {
 	log.Println("BLE_LOG: Discovering GATT services...")
 
-	// Wait for services to be resolved
-	time.Sleep(2 * time.Second)
+	// Ensure services are resolved
+	deviceObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.devicePath)
+	
+	// Check if services are resolved
+	var servicesResolved bool
+	maxRetries := 5
+	for i := 0; i < maxRetries; i++ {
+		if err := deviceObj.Call("org.freedesktop.DBus.Properties.Get", 0, BLUEZ_DEVICE_INTERFACE, "ServicesResolved").Store(&servicesResolved); err == nil && servicesResolved {
+			log.Println("BLE_LOG: Services resolved")
+			break
+		}
+		
+		if i < maxRetries-1 {
+			log.Printf("BLE_LOG: Waiting for services to be resolved (attempt %d/%d)...", i+1, maxRetries)
+			time.Sleep(2 * time.Second)
+		}
+	}
+	
+	if !servicesResolved {
+		log.Println("BLE_LOG: Warning - services may not be fully resolved")
+	}
 
 	// Get all managed objects to find services
 	objects := make(map[dbus.ObjectPath]map[string]map[string]dbus.Variant)
@@ -241,6 +504,8 @@ func (bc *BleClient) discoverGattService() error {
 
 	// Look for GATT services under this device
 	devicePathStr := string(bc.devicePath)
+	serviceCount := 0
+	
 	for path, interfaces := range objects {
 		pathStr := string(path)
 		
@@ -251,10 +516,12 @@ func (bc *BleClient) discoverGattService() error {
 		
 		// Check if it's a GATT service
 		if svcIface, hasGattService := interfaces["org.bluez.GattService1"]; hasGattService {
+			serviceCount++
+			
 			// Get the UUID
 			if uuidVariant, ok := svcIface["UUID"]; ok {
 				uuid := uuidVariant.Value().(string)
-				log.Printf("BLE_LOG: Found service: %s", uuid)
+				log.Printf("BLE_LOG: Found service %d: %s", serviceCount, uuid)
 				
 				if strings.EqualFold(uuid, NocturneServiceUUID) {
 					log.Printf("BLE_LOG: Found Nocturne service at: %s", path)
@@ -278,7 +545,11 @@ func (bc *BleClient) discoverGattService() error {
 		}
 	}
 
-	return fmt.Errorf("Nocturne GATT service not found")
+	if serviceCount == 0 {
+		return fmt.Errorf("no GATT services found - device may not be properly connected")
+	}
+
+	return fmt.Errorf("Nocturne GATT service not found among %d services", serviceCount)
 }
 
 func (bc *BleClient) setupCharacteristics() error {
