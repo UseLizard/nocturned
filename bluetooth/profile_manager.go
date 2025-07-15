@@ -294,20 +294,9 @@ func (pm *ProfileManager) handleProfileConnection(req utils.ProfileConnectionReq
 	
 	switch req.ProfileUUID {
 	case PROFILE_SPP_UUID:
-		// SPP connection is handled by MediaClient
-		if pm.btManager.mediaClient != nil {
-			// First, ensure a stable, system-level connection exists.
-			log.Println("Ensuring system-level connection via ConnectDevice before SPP.")
-			if err := pm.btManager.ConnectDevice(req.DeviceAddress); err != nil {
-				log.Printf("ConnectDevice failed: %v. Proceeding with SPP attempt anyway.", err)
-			} else {
-				// Give the connection a moment to stabilize before trying RFCOMM
-				time.Sleep(1 * time.Second)
-			}
-
-			err = pm.btManager.mediaClient.DiscoverAndConnect()
-			success = (err == nil)
-		}
+		// SPP is no longer supported - use BLE instead
+		err = fmt.Errorf("SPP profile no longer supported, please use BLE")
+		success = false
 		
 	case PROFILE_NAP_UUID:
 		// Network connection

@@ -1079,9 +1079,8 @@ func main() {
 			return
 		}
 
-		if mediaClient := btManager.GetMediaClient(); mediaClient != nil {
-			mediaClient.SimulateStateUpdate(req.Artist, req.Track, req.IsPlaying)
-		}
+		// Simulation is no longer supported with BLE-only implementation
+		log.Println("Media simulation endpoint called - not supported in BLE-only mode")
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "success"})

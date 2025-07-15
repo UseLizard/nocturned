@@ -23,7 +23,7 @@ type BluetoothManager struct {
 	pairingRequests    chan utils.PairingRequest
 	wsHub              *utils.WebSocketHub
 	pendingDisconnects sync.Map
-	mediaClient        *MediaClient
+	bleClient          *BleClient      // BLE media client
 	profileManager     *ProfileManager
 }
 
@@ -60,8 +60,9 @@ func NewBluetoothManager(wsHub *utils.WebSocketHub) (*BluetoothManager, error) {
 	manager.monitorDisconnects()
 	manager.monitorNetworkInterfaces()
 
-	manager.mediaClient = NewMediaClient(manager, wsHub)
-	go manager.initializeMediaClient()
+	// Initialize BLE media client
+	manager.bleClient = NewBleClient(manager, wsHub)
+	go manager.initializeBLEClient()
 
 	manager.profileManager = NewProfileManager(manager, wsHub)
 
@@ -434,45 +435,54 @@ func (m *BluetoothManager) DisconnectDevice(address string) error {
 	return nil
 }
 
-func (m *BluetoothManager) initializeMediaClient() {
-	log.Println("🚀 MediaClient: Starting initialization loop...")
+func (m *BluetoothManager) initializeBLEClient() {
+	log.Println("🚀 BLE: Starting BLE client initialization...")
 
+	log.Println("🚀 BLE MediaClient: Starting initialization loop...")
 	for {
-		log.Println("🔄 MediaClient: Attempting discovery and connection...")
-		if err := m.mediaClient.DiscoverAndConnect(); err != nil {
-			log.Printf("❌ MediaClient: Connection failed: %v", err)
-			log.Println("⏰ MediaClient: Retrying in 30 seconds...")
+		log.Println("🔄 BLE MediaClient: Attempting discovery and connection...")
+		if err := m.bleClient.DiscoverAndConnect(); err != nil {
+			log.Printf("❌ BLE MediaClient: Connection failed: %v", err)
+			log.Println("⏰ BLE MediaClient: Retrying in 30 seconds...")
 			time.Sleep(30 * time.Second)
 			continue
 		}
-		log.Println("✅ MediaClient: Successfully connected! Exiting initialization loop.")
+		log.Println("✅ BLE MediaClient: Successfully connected!")
 		break
 	}
 }
 
-func (m *BluetoothManager) GetMediaClient() *MediaClient {
-	return m.mediaClient
+func (m *BluetoothManager) GetBleClient() *BleClient {
+	return m.bleClient
 }
 
 func (m *BluetoothManager) SendMediaCommand(command string, valueMs *int, valuePercent *int) error {
-	if m.mediaClient == nil {
-		return fmt.Errorf("media client not initialized")
+	// Use BLE client only
+	if m.bleClient != nil && m.bleClient.IsConnected() {
+		log.Printf("Sending media command via BLE: %s", command)
+		return m.bleClient.SendCommand(command, valueMs, valuePercent)
 	}
-	return m.mediaClient.SendCommand(command, valueMs, valuePercent)
+	
+	return fmt.Errorf("BLE client not connected")
 }
 
 func (m *BluetoothManager) GetMediaState() *utils.MediaStateUpdate {
-	if m.mediaClient == nil {
-		return nil
+	// Get state from whichever client is connected (BLE preferred)
+	if m.bleClient != nil && m.bleClient.IsConnected() {
+		return m.bleClient.GetCurrentState()
 	}
-	return m.mediaClient.GetCurrentState()
+	
+	return nil
 }
 
 func (m *BluetoothManager) IsMediaConnected() bool {
-	if m.mediaClient == nil {
-		return false
+	return m.bleClient != nil && m.bleClient.IsConnected()
+}
+
+func (m *BluetoothManager) GetConnectionStatus() map[string]bool {
+	return map[string]bool{
+		"ble_connected": m.bleClient != nil && m.bleClient.IsConnected(),
 	}
-	return m.mediaClient.IsConnected()
 }
 
 func (m *BluetoothManager) GetProfileManager() *ProfileManager {
