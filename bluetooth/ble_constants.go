@@ -3,11 +3,12 @@ package bluetooth
 import "time"
 
 const (
-	// Service and Characteristic UUIDs (must match Android)
-	NocturneServiceUUID    = "12345678-1234-5678-9abc-def012345678"
-	CommandRxCharUUID      = "12345678-1234-5678-9abc-def012345679"
-	ResponseTxCharUUID     = "12345678-1234-5678-9abc-def01234567a"
-	AlbumArtRxCharUUID     = "12345678-1234-5678-9abc-def01234567b"
+	// Service and Characteristic UUIDs (Nordic UART Service compatible)
+	NocturneServiceUUID    = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+	CommandRxCharUUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e" // Write
+	ResponseTxCharUUID     = "6e400003-b5a3-f393-e0a9-e50e24dcca9e" // Notify (State TX in Android)
+	DebugLogCharUUID       = "6e400004-b5a3-f393-e0a9-e50e24dcca9e" // Notify
+	DeviceInfoCharUUID     = "6e400005-b5a3-f393-e0a9-e50e24dcca9e" // Read
 	
 	// BLE Configuration
 	TargetMTU         = uint16(512)

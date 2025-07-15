@@ -28,7 +28,8 @@ type BleClient struct {
 	servicePath       dbus.ObjectPath
 	commandRxCharPath dbus.ObjectPath
 	responseTxCharPath dbus.ObjectPath
-	albumArtRxCharPath dbus.ObjectPath
+	debugLogCharPath  dbus.ObjectPath
+	deviceInfoCharPath dbus.ObjectPath
 	bleConnected      bool
 	mtu               uint16
 }
@@ -83,27 +84,32 @@ func (bc *BleClient) discoverNocturneCompanion() (string, error) {
 	log.Printf("🔍 BLE_LOG: Scanning %d devices for NocturneCompanion with GATT services...", len(devices))
 
 	// Look for devices with NocturneCompanion name that support GATT
+	// Note: BLE devices may not be "connected" when advertising
 	for _, device := range devices {
-		if device.Paired && device.Connected &&
-			(device.Name == DeviceName) &&
-			bc.deviceSupportsGatt(device.Address) {
-			log.Printf("Found BLE NocturneCompanion device: %s (%s)", device.Name, device.Address)
+		if device.Name == DeviceName {
+			log.Printf("BLE_LOG: Found device with matching name: %s (%s) - Paired: %v, Connected: %v", 
+				device.Name, device.Address, device.Paired, device.Connected)
 			
-			// Broadcast device found
-			if bc.wsHub != nil {
-				bc.wsHub.Broadcast(utils.WebSocketEvent{
-					Type: "media/ble_device_found",
-					Payload: map[string]interface{}{
-						"name":      device.Name,
-						"address":   device.Address,
-						"paired":    device.Paired,
-						"connected": device.Connected,
-						"timestamp": time.Now().Unix(),
-					},
-				})
+			// For BLE, we don't require the device to be connected yet
+			if device.Paired || bc.deviceSupportsGatt(device.Address) {
+				log.Printf("Found BLE NocturneCompanion device: %s (%s)", device.Name, device.Address)
+				
+				// Broadcast device found
+				if bc.wsHub != nil {
+					bc.wsHub.Broadcast(utils.WebSocketEvent{
+						Type: "media/ble_device_found",
+						Payload: map[string]interface{}{
+							"name":      device.Name,
+							"address":   device.Address,
+							"paired":    device.Paired,
+							"connected": device.Connected,
+							"timestamp": time.Now().Unix(),
+						},
+					})
+				}
+				
+				return device.Address, nil
 			}
-			
-			return device.Address, nil
 		}
 	}
 
@@ -311,12 +317,16 @@ func (bc *BleClient) setupCharacteristics() error {
 					charType = "Command RX"
 				case strings.ToLower(ResponseTxCharUUID):
 					bc.responseTxCharPath = path
-					log.Println("BLE_LOG: Found Response TX characteristic")
+					log.Println("BLE_LOG: Found Response TX characteristic (State TX)")
 					charType = "Response TX"
-				case strings.ToLower(AlbumArtRxCharUUID):
-					bc.albumArtRxCharPath = path
-					log.Println("BLE_LOG: Found Album Art RX characteristic")
-					charType = "Album Art RX"
+				case strings.ToLower(DebugLogCharUUID):
+					bc.debugLogCharPath = path
+					log.Println("BLE_LOG: Found Debug Log characteristic")
+					charType = "Debug Log"
+				case strings.ToLower(DeviceInfoCharUUID):
+					bc.deviceInfoCharPath = path
+					log.Println("BLE_LOG: Found Device Info characteristic")
+					charType = "Device Info"
 				default:
 					charType = "Unknown"
 				}
@@ -344,14 +354,27 @@ func (bc *BleClient) setupCharacteristics() error {
 	if bc.responseTxCharPath == "" {
 		return fmt.Errorf("Response TX characteristic not found")
 	}
-	if bc.albumArtRxCharPath == "" {
-		return fmt.Errorf("Album Art RX characteristic not found")
+	// Optional characteristics: debugLogCharPath, deviceInfoCharPath
+	
+	// Read device info if available
+	if bc.deviceInfoCharPath != "" {
+		go bc.readDeviceInfo()
 	}
 
 	// Enable notifications for response characteristic
 	charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.responseTxCharPath)
 	if err := charObj.Call("org.bluez.GattCharacteristic1.StartNotify", 0).Err; err != nil {
-		log.Printf("BLE_LOG: Warning - failed to enable notifications: %v", err)
+		log.Printf("BLE_LOG: Warning - failed to enable notifications on Response TX: %v", err)
+	}
+	
+	// Enable notifications for debug log characteristic if available
+	if bc.debugLogCharPath != "" {
+		debugCharObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.debugLogCharPath)
+		if err := debugCharObj.Call("org.bluez.GattCharacteristic1.StartNotify", 0).Err; err != nil {
+			log.Printf("BLE_LOG: Warning - failed to enable notifications on Debug Log: %v", err)
+		} else {
+			log.Println("BLE_LOG: Enabled notifications on Debug Log characteristic")
+		}
 	}
 
 	return nil
@@ -412,8 +435,17 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 	rule := fmt.Sprintf("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='%s'", bc.responseTxCharPath)
 	
 	if err := bc.conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule).Err; err != nil {
-		log.Printf("BLE_LOG: Failed to add match rule: %v", err)
+		log.Printf("BLE_LOG: Failed to add match rule for response: %v", err)
 		return
+	}
+	
+	// Also subscribe to debug log characteristic if available
+	var debugRule string
+	if bc.debugLogCharPath != "" {
+		debugRule = fmt.Sprintf("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='%s'", bc.debugLogCharPath)
+		if err := bc.conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, debugRule).Err; err != nil {
+			log.Printf("BLE_LOG: Failed to add match rule for debug: %v", err)
+		}
 	}
 
 	// Create a channel to receive signals
@@ -427,6 +459,9 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 		case <-bc.stopChan:
 			log.Println("BLE_LOG: Stopping notification monitor")
 			bc.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
+			if debugRule != "" {
+				bc.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, debugRule)
+			}
 			return
 			
 		case sig := <-sigChan:
@@ -434,9 +469,17 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 				continue
 			}
 
-			// Check if this is a PropertiesChanged signal for our characteristic
-			if sig.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" && 
-			   sig.Path == bc.responseTxCharPath {
+			// Check if this is a PropertiesChanged signal for our characteristics
+			if sig.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
+				var charType string
+				if sig.Path == bc.responseTxCharPath {
+					charType = "response"
+				} else if bc.debugLogCharPath != "" && sig.Path == bc.debugLogCharPath {
+					charType = "debug"
+				} else {
+					continue // Not our characteristic
+				}
+				
 				// The signal has format: interface_name, changed_properties, invalidated_properties
 				if len(sig.Body) >= 2 {
 					if changedProps, ok := sig.Body[1].(map[string]dbus.Variant); ok {
@@ -447,14 +490,14 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 									bc.wsHub.Broadcast(utils.WebSocketEvent{
 										Type: "media/ble_notification_received",
 										Payload: map[string]interface{}{
-											"char_type": "response",
+											"char_type": charType,
 											"data":      string(value),
 											"size":      len(value),
 											"timestamp": time.Now().Unix(),
 										},
 									})
 								}
-								bc.handleNotificationData(value, "response")
+								bc.handleNotificationData(value, charType)
 							}
 						}
 					}
@@ -485,32 +528,97 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 		})
 	}
 
-	// Try to parse as MediaCommand first (for album art)
-	var command utils.MediaCommand
-	if err := json.Unmarshal(data, &command); err == nil && command.Command != "" {
-		if command.Command == "album_art" {
-			bc.handleAlbumArtCommand(&command)
-			return
-		}
+	// Try to parse the message type first
+	var msgType struct {
+		Type string `json:"type"`
 	}
-
-	// Parse state update from Android app
-	var stateUpdate utils.MediaStateUpdate
-	if err := json.Unmarshal(data, &stateUpdate); err != nil {
-		log.Printf("Failed to parse media state update: %v", err)
+	if err := json.Unmarshal(data, &msgType); err != nil {
+		log.Printf("Failed to parse message type: %v", err)
 		return
 	}
 
-	bc.mu.Lock()
-	bc.currentState = &stateUpdate
-	bc.mu.Unlock()
+	// Handle different message types
+	switch msgType.Type {
+	case "ack":
+		// Command acknowledgment
+		var ack struct {
+			Type      string `json:"type"`
+			CommandID string `json:"command_id"`
+			Status    string `json:"status"`
+			Message   string `json:"message"`
+		}
+		if err := json.Unmarshal(data, &ack); err == nil {
+			log.Printf("BLE ACK: %s - %s (%s)", ack.CommandID, ack.Status, ack.Message)
+		}
+		
+	case "error":
+		// Error message
+		var errMsg struct {
+			Type      string `json:"type"`
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Timestamp int64  `json:"timestamp"`
+		}
+		if err := json.Unmarshal(data, &errMsg); err == nil {
+			log.Printf("BLE ERROR: %s - %s", errMsg.Code, errMsg.Message)
+		}
+		
+	case "capabilities":
+		// Device capabilities
+		var caps struct {
+			Type         string   `json:"type"`
+			Version      string   `json:"version"`
+			Features     []string `json:"features"`
+			MTU          int      `json:"mtu"`
+			DebugEnabled bool     `json:"debug_enabled"`
+		}
+		if err := json.Unmarshal(data, &caps); err == nil {
+			log.Printf("BLE Capabilities: Version %s, MTU %d, Features: %v", 
+				caps.Version, caps.MTU, caps.Features)
+			// Update our MTU if provided
+			if caps.MTU > 0 {
+				bc.mu.Lock()
+				bc.mtu = uint16(caps.MTU)
+				bc.mu.Unlock()
+			}
+		}
+		
+	case "stateUpdate":
+		// Media state update
+		var stateUpdate utils.MediaStateUpdate
+		if err := json.Unmarshal(data, &stateUpdate); err != nil {
+			log.Printf("Failed to parse media state update: %v", err)
+			return
+		}
 
-	// Broadcast to WebSocket clients
-	if bc.wsHub != nil {
-		bc.wsHub.Broadcast(utils.WebSocketEvent{
-			Type:    "media/state_update",
-			Payload: stateUpdate,
-		})
+		bc.mu.Lock()
+		bc.currentState = &stateUpdate
+		bc.mu.Unlock()
+
+		// Broadcast to WebSocket clients
+		if bc.wsHub != nil {
+			bc.wsHub.Broadcast(utils.WebSocketEvent{
+				Type:    "media/state_update",
+				Payload: stateUpdate,
+			})
+		}
+		
+	case "debugLog":
+		// Debug log entry
+		var debugLog struct {
+			Type      string                 `json:"type"`
+			Timestamp int64                  `json:"timestamp"`
+			Level     string                 `json:"level"`
+			LogType   string                 `json:"type"`
+			Message   string                 `json:"message"`
+			Data      map[string]interface{} `json:"data"`
+		}
+		if err := json.Unmarshal(data, &debugLog); err == nil {
+			log.Printf("BLE DEBUG [%s] %s: %s", debugLog.Level, debugLog.LogType, debugLog.Message)
+		}
+		
+	default:
+		log.Printf("Unknown BLE message type: %s", msgType.Type)
 	}
 }
 
@@ -609,10 +717,38 @@ func (bc *BleClient) IsConnected() bool {
 	return bc.connected && bc.targetAddress != "" && bc.bleConnected
 }
 
-func (bc *BleClient) handleAlbumArtCommand(command *utils.MediaCommand) {
-	// Album art transfer not yet implemented for BLE
-	log.Printf("BLE: Album art transfer not implemented - hash=%s, chunk=%d/%d", 
-		command.Hash, command.ChunkIndex+1, command.TotalChunks)
+func (bc *BleClient) readDeviceInfo() {
+	log.Println("BLE_LOG: Reading device info characteristic")
+	
+	charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.deviceInfoCharPath)
+	options := make(map[string]interface{})
+	
+	var value []byte
+	if err := charObj.Call("org.bluez.GattCharacteristic1.ReadValue", 0, options).Store(&value); err != nil {
+		log.Printf("BLE_LOG: Failed to read device info: %v", err)
+		return
+	}
+	
+	log.Printf("BLE_LOG: Device info: %s", string(value))
+	
+	// Parse and handle capabilities
+	var caps struct {
+		Type         string   `json:"type"`
+		Version      string   `json:"version"`
+		Features     []string `json:"features"`
+		MTU          int      `json:"mtu"`
+		DebugEnabled bool     `json:"debug_enabled"`
+	}
+	if err := json.Unmarshal(value, &caps); err == nil {
+		log.Printf("BLE Device Capabilities: Version %s, MTU %d, Features: %v", 
+			caps.Version, caps.MTU, caps.Features)
+		// Update our MTU if provided
+		if caps.MTU > 0 {
+			bc.mu.Lock()
+			bc.mtu = uint16(caps.MTU)
+			bc.mu.Unlock()
+		}
+	}
 }
 
 func (bc *BleClient) handleConnectionLoss() {
