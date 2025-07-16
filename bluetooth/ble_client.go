@@ -771,7 +771,7 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 	
 	// Add rate limiting to prevent notification floods
 	lastNotificationTime := make(map[string]time.Time)
-	notificationMinInterval := 100 * time.Millisecond
+	notificationMinInterval := 15 * time.Millisecond
 
 	// Subscribe to PropertiesChanged signals for the response characteristic
 	rule := fmt.Sprintf("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='%s'", bc.responseTxCharPath)
