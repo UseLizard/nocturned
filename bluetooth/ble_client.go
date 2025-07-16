@@ -12,6 +12,23 @@ import (
 	"github.com/usenocturne/nocturned/utils"
 )
 
+// CommandQueueItem represents a command in the queue
+type CommandQueueItem struct {
+	id           string
+	command      string
+	valueMs      *int
+	valuePercent *int
+	timestamp    time.Time
+	retryCount   int
+	callback     chan error
+}
+
+// CommandAck represents acknowledgment from the device
+type CommandAck struct {
+	CommandID string `json:"command_id"`
+	Status    string `json:"status"` // "received" or "success"
+}
+
 type BleClient struct {
 	connected         bool
 	targetAddress     string
@@ -32,15 +49,36 @@ type BleClient struct {
 	deviceInfoCharPath dbus.ObjectPath
 	bleConnected      bool
 	mtu               uint16
+	
+	// Rate limiting for commands
+	lastCommandTime   time.Time
+	commandMutex      sync.Mutex
+	
+	// Command queue with ACK handling
+	commandQueue      chan *CommandQueueItem
+	commandQueueMu    sync.Mutex
+	activeCommand     *CommandQueueItem
+	lastCommandID     string
+	ackTimeout        time.Duration
+	
+	// Connection state tracking
+	fullyConnected    bool
+	capsReceived      bool
+	
+	// Polling for state updates
+	pollingTicker     *time.Ticker
+	lastPolledValue   []byte
 }
 
 func NewBleClient(btManager *BluetoothManager, wsHub *utils.WebSocketHub) *BleClient {
 	return &BleClient{
-		btManager:   btManager,
-		wsHub:       wsHub,
-		conn:        btManager.conn, // Reuse existing D-Bus connection
-		stopChan:    make(chan struct{}),
-		mtu:         DefaultMTU,
+		btManager:     btManager,
+		wsHub:         wsHub,
+		conn:          btManager.conn, // Reuse existing D-Bus connection
+		stopChan:      make(chan struct{}),
+		mtu:           DefaultMTU,
+		commandQueue:  make(chan *CommandQueueItem, 100), // Buffer up to 100 commands
+		ackTimeout:    3 * time.Second,
 	}
 }
 
@@ -460,6 +498,14 @@ func (bc *BleClient) connectBLE() error {
 
 	// Start monitoring notifications
 	go bc.handleBleNotifications()
+	
+	// Start command queue processor
+	go bc.processCommandQueue()
+	
+	// Disabled polling - it causes notification floods
+	// The polling by reading characteristics triggers the Android app to send notifications
+	// which creates an infinite loop. We'll rely on D-Bus notifications instead.
+	// go bc.startStatePolling()
 
 	log.Printf("BLE GATT connection established to %s", bc.targetAddress)
 	return nil
@@ -635,10 +681,20 @@ func (bc *BleClient) setupCharacteristics() error {
 	// Enable notifications for response characteristic
 	charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.responseTxCharPath)
 	if err := charObj.Call("org.bluez.GattCharacteristic1.StartNotify", 0).Err; err != nil {
-		log.Printf("BLE_LOG: Warning - failed to enable notifications on Response TX: %v", err)
+		log.Printf("BLE_LOG: ERROR - failed to enable notifications on Response TX: %v", err)
+		// Try to continue anyway, but this is likely to cause issues
+	} else {
+		log.Println("BLE_LOG: Successfully enabled notifications on Response TX characteristic")
 	}
 	
-	// Enable notifications for debug log characteristic if available
+	// DISABLED: Debug log notifications cause feedback loop
+	// The Android app logs "Notification sent" for every notification,
+	// which triggers a debug log notification, which logs "Notification sent",
+	// creating an infinite loop that floods the connection.
+	// 
+	// To enable debug logs safely, the Android app needs to be fixed to not log
+	// debug messages when sending debug log notifications.
+	/*
 	if bc.debugLogCharPath != "" {
 		debugCharObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.debugLogCharPath)
 		if err := debugCharObj.Call("org.bluez.GattCharacteristic1.StartNotify", 0).Err; err != nil {
@@ -647,6 +703,7 @@ func (bc *BleClient) setupCharacteristics() error {
 			log.Println("BLE_LOG: Enabled notifications on Debug Log characteristic")
 		}
 	}
+	*/
 
 	return nil
 }
@@ -670,8 +727,10 @@ func (bc *BleClient) handleBleNotifications() {
 	go bc.monitorCharacteristicNotifications()
 
 	// Keep the goroutine alive and monitor connection
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(60 * time.Second)  // Increased from 30s to reduce connection checks
 	defer ticker.Stop()
+	
+	connectionCheckFailures := 0
 
 	for {
 		select {
@@ -684,9 +743,14 @@ func (bc *BleClient) handleBleNotifications() {
 				deviceObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.devicePath)
 				var connected bool
 				if err := deviceObj.Call("org.freedesktop.DBus.Properties.Get", 0, BLUEZ_DEVICE_INTERFACE, "Connected").Store(&connected); err != nil {
-					log.Printf("BLE_LOG: Error checking connection: %v", err)
-					bc.handleConnectionLoss()
-					return
+					connectionCheckFailures++
+					log.Printf("BLE_LOG: Error checking connection (failure %d/3): %v", connectionCheckFailures, err)
+					// Only handle connection loss after 3 consecutive failures
+					if connectionCheckFailures >= 3 {
+						bc.handleConnectionLoss()
+						return
+					}
+					continue
 				}
 				
 				if !connected {
@@ -694,6 +758,9 @@ func (bc *BleClient) handleBleNotifications() {
 					bc.handleConnectionLoss()
 					return
 				}
+				
+				// Reset failure count on successful check
+				connectionCheckFailures = 0
 			}
 		}
 	}
@@ -701,6 +768,10 @@ func (bc *BleClient) handleBleNotifications() {
 
 func (bc *BleClient) monitorCharacteristicNotifications() {
 	log.Printf("BLE_LOG: Setting up D-Bus signal monitoring for notifications")
+	
+	// Add rate limiting to prevent notification floods
+	lastNotificationTime := make(map[string]time.Time)
+	notificationMinInterval := 100 * time.Millisecond
 
 	// Subscribe to PropertiesChanged signals for the response characteristic
 	rule := fmt.Sprintf("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='%s'", bc.responseTxCharPath)
@@ -710,7 +781,9 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 		return
 	}
 	
-	// Also subscribe to debug log characteristic if available
+	// DISABLED: Debug log monitoring to prevent feedback loop
+	// See comment above about debug log notifications causing infinite loops
+	/*
 	var debugRule string
 	if bc.debugLogCharPath != "" {
 		debugRule = fmt.Sprintf("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='%s'", bc.debugLogCharPath)
@@ -718,6 +791,7 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 			log.Printf("BLE_LOG: Failed to add match rule for debug: %v", err)
 		}
 	}
+	*/
 
 	// Create a channel to receive signals
 	sigChan := make(chan *dbus.Signal, 100)
@@ -730,9 +804,7 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 		case <-bc.stopChan:
 			log.Println("BLE_LOG: Stopping notification monitor")
 			bc.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
-			if debugRule != "" {
-				bc.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, debugRule)
-			}
+			// Debug rule removal disabled since we're not adding it anymore
 			return
 			
 		case sig := <-sigChan:
@@ -745,9 +817,15 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 				var charType string
 				if sig.Path == bc.responseTxCharPath {
 					charType = "response"
+					log.Printf("BLE_LOG: Received notification on Response TX characteristic")
 				} else if bc.debugLogCharPath != "" && sig.Path == bc.debugLogCharPath {
 					charType = "debug"
+					log.Printf("BLE_LOG: Received notification on Debug Log characteristic")
 				} else {
+					// Log other signals for debugging
+					if strings.Contains(string(sig.Path), string(bc.devicePath)) {
+						log.Printf("BLE_LOG: Received signal on path %s (not our characteristic)", sig.Path)
+					}
 					continue // Not our characteristic
 				}
 				
@@ -756,6 +834,16 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 					if changedProps, ok := sig.Body[1].(map[string]dbus.Variant); ok {
 						if valueVariant, exists := changedProps["Value"]; exists {
 							if value, ok := valueVariant.Value().([]byte); ok {
+								// Check rate limiting
+								now := time.Now()
+								if lastTime, exists := lastNotificationTime[charType]; exists {
+									if now.Sub(lastTime) < notificationMinInterval {
+										log.Printf("BLE_LOG: Rate limiting notification on %s (too fast: %v)", charType, now.Sub(lastTime))
+										continue
+									}
+								}
+								lastNotificationTime[charType] = now
+								
 								// Broadcast notification received
 								if bc.wsHub != nil {
 									bc.wsHub.Broadcast(utils.WebSocketEvent{
@@ -812,14 +900,19 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 	switch msgType.Type {
 	case "ack":
 		// Command acknowledgment
-		var ack struct {
-			Type      string `json:"type"`
-			CommandID string `json:"command_id"`
-			Status    string `json:"status"`
-			Message   string `json:"message"`
-		}
+		var ack CommandAck
 		if err := json.Unmarshal(data, &ack); err == nil {
-			log.Printf("BLE ACK: %s - %s (%s)", ack.CommandID, ack.Status, ack.Message)
+			log.Printf("BLE ACK: %s - %s", ack.CommandID, ack.Status)
+			
+			// Handle ACK for active command
+			bc.commandQueueMu.Lock()
+			if bc.activeCommand != nil && bc.activeCommand.id == ack.CommandID {
+				if ack.Status == "success" {
+					log.Printf("BLE_LOG: Command %s completed successfully", bc.activeCommand.command)
+					bc.activeCommand = nil
+				}
+			}
+			bc.commandQueueMu.Unlock()
 		}
 		
 	case "error":
@@ -850,7 +943,20 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 			if caps.MTU > 0 {
 				bc.mu.Lock()
 				bc.mtu = uint16(caps.MTU)
+				bc.capsReceived = true
+				bc.fullyConnected = true
 				bc.mu.Unlock()
+			}
+			
+			// Broadcast ready state
+			if bc.wsHub != nil {
+				bc.wsHub.Broadcast(utils.WebSocketEvent{
+					Type: "media/ready",
+					Payload: map[string]interface{}{
+						"mtu":     caps.MTU,
+						"version": caps.Version,
+					},
+				})
 			}
 		}
 		
@@ -862,12 +968,16 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 			return
 		}
 
+		log.Printf("BLE_LOG: Received state update - Track: %s, Playing: %v, Position: %d ms", 
+			stateUpdate.Track, stateUpdate.IsPlaying, stateUpdate.PositionMs)
+
 		bc.mu.Lock()
 		bc.currentState = &stateUpdate
 		bc.mu.Unlock()
 
 		// Broadcast to WebSocket clients
 		if bc.wsHub != nil {
+			log.Printf("BLE_LOG: Broadcasting state update to WebSocket clients")
 			bc.wsHub.Broadcast(utils.WebSocketEvent{
 				Type:    "media/state_update",
 				Payload: stateUpdate,
@@ -893,18 +1003,89 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 	}
 }
 
+// SendCommand queues a command for sending with ACK handling
 func (bc *BleClient) SendCommand(command string, valueMs *int, valuePercent *int) error {
 	bc.mu.RLock()
-	defer bc.mu.RUnlock()
-
 	if !bc.connected || bc.targetAddress == "" || !bc.bleConnected || bc.commandRxCharPath == "" {
+		bc.mu.RUnlock()
 		return fmt.Errorf("not connected to BLE media device")
 	}
+	bc.mu.RUnlock()
 
+	// Generate command ID
+	cmdID := fmt.Sprintf("cmd_%d_%d", time.Now().UnixNano(), len(command))
+	
+	// Create command item
+	cmdItem := &CommandQueueItem{
+		id:           cmdID,
+		command:      command,
+		valueMs:      valueMs,
+		valuePercent: valuePercent,
+		timestamp:    time.Now(),
+		callback:     make(chan error, 1),
+	}
+	
+	// Add to queue (non-blocking)
+	select {
+	case bc.commandQueue <- cmdItem:
+		log.Printf("BLE_LOG: Queued command %s with ID %s", command, cmdID)
+	default:
+		log.Printf("BLE_LOG: Command queue full, dropping command %s", command)
+		return fmt.Errorf("command queue full")
+	}
+	
+	// Wait for command to be processed
+	select {
+	case err := <-cmdItem.callback:
+		return err
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("command timeout after 10 seconds")
+	}
+}
+
+// processCommandQueue handles sending commands from the queue
+func (bc *BleClient) processCommandQueue() {
+	for {
+		select {
+		case <-bc.stopChan:
+			return
+		case cmd := <-bc.commandQueue:
+			if cmd == nil {
+				continue
+			}
+			
+			// Send the command
+			err := bc.sendCommandImmediate(cmd)
+			
+			// Notify callback
+			if cmd.callback != nil {
+				cmd.callback <- err
+			}
+		}
+	}
+}
+
+// sendCommandImmediate actually sends a command and waits for ACK
+func (bc *BleClient) sendCommandImmediate(cmdItem *CommandQueueItem) error {
+	bc.commandQueueMu.Lock()
+	bc.activeCommand = cmdItem
+	bc.lastCommandID = cmdItem.id
+	bc.commandQueueMu.Unlock()
+	
+	// Rate limit commands
+	const minCommandInterval = 50 * time.Millisecond
+	timeSinceLastCommand := time.Since(bc.lastCommandTime)
+	if timeSinceLastCommand < minCommandInterval {
+		waitTime := minCommandInterval - timeSinceLastCommand
+		log.Printf("BLE_LOG: Rate limiting - waiting %v before sending command", waitTime)
+		time.Sleep(waitTime)
+	}
+	
 	cmd := utils.MediaCommand{
-		Command:      command,
-		ValueMs:      valueMs,
-		ValuePercent: valuePercent,
+		Command:      cmdItem.command,
+		ValueMs:      cmdItem.valueMs,
+		ValuePercent: cmdItem.valuePercent,
+		CommandID:    cmdItem.id, // Include command ID for ACK tracking
 	}
 
 	// Convert command to JSON
@@ -913,39 +1094,96 @@ func (bc *BleClient) SendCommand(command string, valueMs *int, valuePercent *int
 		return fmt.Errorf("failed to marshal command: %v", err)
 	}
 
-	// Calculate chunk size based on MTU
-	maxChunkSize := int(bc.mtu - MTUHeaderSize)
-	if maxChunkSize > len(cmdJson) {
-		// Send in single chunk using D-Bus
-		charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
-		options := make(map[string]interface{})
-		
-		if err := charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err; err != nil {
-			log.Printf("Failed to send BLE command: %v", err)
-			bc.bleConnected = false
-			return fmt.Errorf("failed to send command over BLE: %v", err)
+	log.Printf("BLE_LOG: Sending command: %s with ID: %s (JSON: %s)", cmdItem.command, cmdItem.id, string(cmdJson))
+
+	// Send using D-Bus
+	charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
+	options := make(map[string]interface{})
+	
+	// Try to send
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("BLE_LOG: Retry attempt %d for command %s", attempt, cmdItem.command)
+			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
 		}
-	} else {
-		// TODO: Implement chunking for large commands if needed
-		return fmt.Errorf("command too large for current MTU (%d bytes, max %d)", len(cmdJson), maxChunkSize)
+		
+		err = charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err
+		if err == nil {
+			bc.lastCommandTime = time.Now()
+			log.Printf("BLE_LOG: Command sent successfully, waiting for ACK...")
+			
+			// For now, we'll proceed without waiting for ACK
+			// TODO: Implement proper ACK waiting with channel communication
+			// This would involve waiting for the ACK to be received in handleNotificationData
+			// and signaling completion via a channel
+			return nil
+		}
+		
+		// Check if it's an ATT error
+		if strings.Contains(err.Error(), "ATT error: 0x0e") {
+			log.Printf("BLE_LOG: ATT error 0x0e - characteristic busy, will retry")
+			continue
+		}
+		
+		// For other errors, log and continue retrying
+		log.Printf("BLE_LOG: Failed to send command: %v", err)
 	}
+	
+	return fmt.Errorf("failed to send command after %d attempts: %v", maxRetries, err)
+}
 
-	log.Printf("Sent BLE media command: %s to %s", command, bc.targetAddress)
-
-	// Broadcast data sent event
-	if bc.wsHub != nil {
-		bc.wsHub.Broadcast(utils.WebSocketEvent{
-			Type: "media/ble_data_sent",
-			Payload: map[string]interface{}{
-				"address":   bc.targetAddress,
-				"command":   command,
-				"data":      string(cmdJson),
-				"timestamp": time.Now().Unix(),
-			},
-		})
+// startStatePolling polls the state characteristic for faster updates
+func (bc *BleClient) startStatePolling() {
+	bc.pollingTicker = time.NewTicker(500 * time.Millisecond)
+	
+	for {
+		select {
+		case <-bc.stopChan:
+			if bc.pollingTicker != nil {
+				bc.pollingTicker.Stop()
+			}
+			return
+		case <-bc.pollingTicker.C:
+			bc.mu.RLock()
+			charPath := bc.responseTxCharPath
+			bc.mu.RUnlock()
+			
+			if charPath != "" {
+				bc.pollCharacteristicValue()
+			}
+		}
 	}
+}
 
-	return nil
+// pollCharacteristicValue reads the current value of the response characteristic
+func (bc *BleClient) pollCharacteristicValue() {
+	charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.responseTxCharPath)
+	options := make(map[string]interface{})
+	
+	var value []byte
+	if err := charObj.Call("org.bluez.GattCharacteristic1.ReadValue", 0, options).Store(&value); err == nil && len(value) > 0 {
+		// Check if value changed since last poll
+		if len(bc.lastPolledValue) == 0 || !bytesEqual(value, bc.lastPolledValue) {
+			bc.lastPolledValue = make([]byte, len(value))
+			copy(bc.lastPolledValue, value)
+			// Process the notification data
+			bc.handleNotificationData(value, "response")
+		}
+	}
+}
+
+// bytesEqual compares two byte slices
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Media control methods (same as SPP client)
@@ -1094,6 +1332,14 @@ func (bc *BleClient) Disconnect() {
 	if bc.connected {
 		bc.connected = false
 		bc.bleConnected = false
+		bc.fullyConnected = false
+		bc.capsReceived = false
+
+		// Stop polling ticker
+		if bc.pollingTicker != nil {
+			bc.pollingTicker.Stop()
+			bc.pollingTicker = nil
+		}
 
 		// Stop monitoring
 		if bc.stopChan != nil {

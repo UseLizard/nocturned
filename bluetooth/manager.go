@@ -6,11 +6,9 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/godbus/dbus/v5"
-	"github.com/vishvananda/netlink"
 
 	"github.com/usenocturne/nocturned/utils"
 )
@@ -58,7 +56,7 @@ func NewBluetoothManager(wsHub *utils.WebSocketHub) (*BluetoothManager, error) {
 	}
 
 	manager.monitorDisconnects()
-	manager.monitorNetworkInterfaces()
+	// Removed monitorNetworkInterfaces() - not needed for BLE
 
 	// Initialize BLE media client
 	manager.bleClient = NewBleClient(manager, wsHub)
@@ -168,29 +166,6 @@ func (m *BluetoothManager) monitorDisconnects() {
 	}()
 }
 
-func (m *BluetoothManager) monitorNetworkInterfaces() {
-	linkUpdates := make(chan netlink.LinkUpdate)
-	done := make(chan struct{})
-
-	if err := netlink.LinkSubscribe(linkUpdates, done); err != nil {
-		log.Printf("Failed to subscribe to link updates: %v", err)
-		return
-	}
-
-	go func() {
-		for update := range linkUpdates {
-			if update.Header.Type == syscall.RTM_DELLINK && update.Link.Attrs().Name == "bnep0" {
-				log.Println("bnep0 interface removed")
-
-				if m.wsHub != nil {
-					m.wsHub.Broadcast(utils.WebSocketEvent{
-						Type: "bluetooth/network/disconnect",
-					})
-				}
-			}
-		}
-	}()
-}
 
 func (m *BluetoothManager) setPower(enable bool) error {
 	obj := m.conn.Object(BLUEZ_BUS_NAME, m.adapter)

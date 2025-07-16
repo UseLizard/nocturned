@@ -85,21 +85,6 @@ func (pm *ProfileManager) GetDefaultProfiles() map[string]utils.BluetoothProfile
 			Priority:    50,
 		},
 		// Data/Network Profiles
-		PROFILE_SPP_UUID: {
-			UUID:        PROFILE_SPP_UUID,
-			Name:        "SPP",
-			Description: "Serial Port Profile - NocturneCompanion communication channel",
-			Category:    CATEGORY_DATA,
-			State:       PROFILE_STATE_DISABLED,
-			Enabled:     true,
-			AutoConnect: true,
-			Priority:    95, // Highest priority for media control
-			Settings: map[string]interface{}{
-				"auto_discovery":   true,
-				"channel_caching":  true,
-				"reconnect_delay":  30,
-			},
-		},
 		PROFILE_PAN_UUID: {
 			UUID:        PROFILE_PAN_UUID,
 			Name:        "PAN",

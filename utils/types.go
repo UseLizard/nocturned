@@ -52,6 +52,7 @@ type NetworkConnectedPayload struct {
 // Media Control (NocturneCompanion Integration)
 type MediaCommand struct {
 	Command      string `json:"command"`
+	CommandID    string `json:"command_id,omitempty"`
 	ValueMs      *int   `json:"value_ms,omitempty"`
 	ValuePercent *int   `json:"value_percent,omitempty"`
 	Hash         string `json:"hash,omitempty"`
