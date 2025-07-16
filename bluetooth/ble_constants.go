@@ -9,6 +9,7 @@ const (
 	ResponseTxCharUUID     = "6e400003-b5a3-f393-e0a9-e50e24dcca9e" // Notify (State TX in Android)
 	DebugLogCharUUID       = "6e400004-b5a3-f393-e0a9-e50e24dcca9e" // Notify
 	DeviceInfoCharUUID     = "6e400005-b5a3-f393-e0a9-e50e24dcca9e" // Read
+	AlbumArtTxCharUUID     = "6e400006-b5a3-f393-e0a9-e50e24dcca9e" // Notify
 	
 	// BLE Configuration
 	TargetMTU         = uint16(512)
@@ -16,6 +17,10 @@ const (
 	MTUHeaderSize     = uint16(3)
 	ScanTimeoutSec    = 30
 	ConnectTimeoutSec = 10
+	
+	// Album Art Transfer Configuration
+	AlbumArtChunkSize       = TargetMTU - MTUHeaderSize // 509 bytes per chunk
+	AlbumArtTransferTimeout = 30 * time.Second
 	
 	// Device identification
 	DeviceName = "NocturneCompanion"

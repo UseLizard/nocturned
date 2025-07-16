@@ -47,6 +47,7 @@ type BleClient struct {
 	responseTxCharPath dbus.ObjectPath
 	debugLogCharPath  dbus.ObjectPath
 	deviceInfoCharPath dbus.ObjectPath
+	albumArtCharPath  dbus.ObjectPath
 	bleConnected      bool
 	mtu               uint16
 	
@@ -68,6 +69,14 @@ type BleClient struct {
 	// Polling for state updates
 	pollingTicker     *time.Ticker
 	lastPolledValue   []byte
+	
+	// Album art transfer management
+	albumArtBuffer    []byte
+	albumArtTrackID   string
+	albumArtSize      int
+	albumArtChecksum  string
+	albumArtReceiving bool
+	albumArtMutex     sync.Mutex
 }
 
 func NewBleClient(btManager *BluetoothManager, wsHub *utils.WebSocketHub) *BleClient {
@@ -644,6 +653,10 @@ func (bc *BleClient) setupCharacteristics() error {
 					bc.deviceInfoCharPath = path
 					log.Println("BLE_LOG: Found Device Info characteristic")
 					charType = "Device Info"
+				case strings.ToLower(AlbumArtTxCharUUID):
+					bc.albumArtCharPath = path
+					log.Println("BLE_LOG: Found Album Art TX characteristic")
+					charType = "Album Art TX"
 				default:
 					charType = "Unknown"
 				}
@@ -685,6 +698,16 @@ func (bc *BleClient) setupCharacteristics() error {
 		// Try to continue anyway, but this is likely to cause issues
 	} else {
 		log.Println("BLE_LOG: Successfully enabled notifications on Response TX characteristic")
+	}
+	
+	// Enable notifications for album art characteristic if available
+	if bc.albumArtCharPath != "" {
+		albumArtCharObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.albumArtCharPath)
+		if err := albumArtCharObj.Call("org.bluez.GattCharacteristic1.StartNotify", 0).Err; err != nil {
+			log.Printf("BLE_LOG: Warning - failed to enable notifications on Album Art TX: %v", err)
+		} else {
+			log.Println("BLE_LOG: Successfully enabled notifications on Album Art TX characteristic")
+		}
 	}
 	
 	// DISABLED: Debug log notifications cause feedback loop
@@ -781,6 +804,15 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 		return
 	}
 	
+	// Add match rule for album art notifications if available
+	var albumArtRule string
+	if bc.albumArtCharPath != "" {
+		albumArtRule = fmt.Sprintf("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='%s'", bc.albumArtCharPath)
+		if err := bc.conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, albumArtRule).Err; err != nil {
+			log.Printf("BLE_LOG: Failed to add match rule for album art: %v", err)
+		}
+	}
+	
 	// DISABLED: Debug log monitoring to prevent feedback loop
 	// See comment above about debug log notifications causing infinite loops
 	/*
@@ -804,6 +836,9 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 		case <-bc.stopChan:
 			log.Println("BLE_LOG: Stopping notification monitor")
 			bc.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
+			if albumArtRule != "" {
+				bc.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, albumArtRule)
+			}
 			// Debug rule removal disabled since we're not adding it anymore
 			return
 			
@@ -818,6 +853,9 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 				if sig.Path == bc.responseTxCharPath {
 					charType = "response"
 					log.Printf("BLE_LOG: Received notification on Response TX characteristic")
+				} else if bc.albumArtCharPath != "" && sig.Path == bc.albumArtCharPath {
+					charType = "albumart"
+					log.Printf("BLE_LOG: Received notification on Album Art TX characteristic")
 				} else if bc.debugLogCharPath != "" && sig.Path == bc.debugLogCharPath {
 					charType = "debug"
 					log.Printf("BLE_LOG: Received notification on Debug Log characteristic")
@@ -867,6 +905,12 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 }
 
 func (bc *BleClient) handleNotificationData(data []byte, charType string) {
+	// Handle album art data differently (raw bytes, not JSON)
+	if charType == "albumart" {
+		bc.handleAlbumArtData(data)
+		return
+	}
+	
 	dataStr := string(data)
 	if len(dataStr) == 0 {
 		return
@@ -1034,6 +1078,47 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 					},
 				})
 			}
+		}
+		
+	case "album_art_start":
+		// Album art transfer starting
+		var artStart struct {
+			Type     string `json:"type"`
+			Size     int    `json:"size"`
+			TrackID  string `json:"track_id"`
+			Checksum string `json:"checksum"`
+		}
+		if err := json.Unmarshal(data, &artStart); err == nil {
+			bc.albumArtMutex.Lock()
+			bc.albumArtReceiving = true
+			bc.albumArtBuffer = make([]byte, 0, artStart.Size)
+			bc.albumArtTrackID = artStart.TrackID
+			bc.albumArtSize = artStart.Size
+			bc.albumArtChecksum = artStart.Checksum
+			bc.albumArtMutex.Unlock()
+			
+			log.Printf("BLE_LOG: Starting album art transfer - Track: %s, Size: %d bytes", 
+				artStart.TrackID, artStart.Size)
+		}
+		
+	case "album_art_end":
+		// Album art transfer complete
+		var artEnd struct {
+			Type        string `json:"type"`
+			TrackID     string `json:"track_id"`
+			Checksum    string `json:"checksum"`
+			TotalChunks int    `json:"total_chunks"`
+		}
+		if err := json.Unmarshal(data, &artEnd); err == nil {
+			bc.albumArtMutex.Lock()
+			if bc.albumArtReceiving && bc.albumArtTrackID == artEnd.TrackID {
+				// Process the completed album art
+				go bc.processAlbumArt()
+			}
+			bc.albumArtMutex.Unlock()
+			
+			log.Printf("BLE_LOG: Album art transfer complete - Track: %s, Chunks: %d", 
+				artEnd.TrackID, artEnd.TotalChunks)
 		}
 		
 	default:
@@ -1262,6 +1347,65 @@ func (bc *BleClient) IsConnected() bool {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 	return bc.connected && bc.targetAddress != "" && bc.bleConnected
+}
+
+func (bc *BleClient) handleAlbumArtData(data []byte) {
+	bc.albumArtMutex.Lock()
+	defer bc.albumArtMutex.Unlock()
+	
+	if !bc.albumArtReceiving {
+		log.Printf("BLE_LOG: Received album art data but not expecting it")
+		return
+	}
+	
+	// Append data to buffer
+	bc.albumArtBuffer = append(bc.albumArtBuffer, data...)
+	log.Printf("BLE_LOG: Received album art chunk - %d bytes (total: %d/%d)", 
+		len(data), len(bc.albumArtBuffer), bc.albumArtSize)
+}
+
+func (bc *BleClient) processAlbumArt() {
+	bc.albumArtMutex.Lock()
+	defer bc.albumArtMutex.Unlock()
+	
+	if !bc.albumArtReceiving || len(bc.albumArtBuffer) == 0 {
+		return
+	}
+	
+	// Verify checksum
+	checksum := utils.CalculateMD5(bc.albumArtBuffer)
+	if checksum != bc.albumArtChecksum {
+		log.Printf("BLE_LOG: Album art checksum mismatch - expected: %s, got: %s", 
+			bc.albumArtChecksum, checksum)
+		bc.albumArtReceiving = false
+		return
+	}
+	
+	// Save album art to file
+	filename := "/tmp/album_art.webp"
+	if err := utils.SaveAlbumArt(bc.albumArtBuffer, filename); err != nil {
+		log.Printf("BLE_LOG: Failed to save album art: %v", err)
+		bc.albumArtReceiving = false
+		return
+	}
+	
+	log.Printf("BLE_LOG: Album art saved successfully - %s (%d bytes)", filename, len(bc.albumArtBuffer))
+	
+	// Broadcast album art update
+	if bc.wsHub != nil {
+		bc.wsHub.Broadcast(utils.WebSocketEvent{
+			Type: "media/album_art_updated",
+			Payload: map[string]interface{}{
+				"track_id": bc.albumArtTrackID,
+				"filename": filename,
+				"size":     len(bc.albumArtBuffer),
+			},
+		})
+	}
+	
+	// Reset state
+	bc.albumArtReceiving = false
+	bc.albumArtBuffer = nil
 }
 
 func (bc *BleClient) readDeviceInfo() {
