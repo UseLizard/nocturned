@@ -998,6 +998,44 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 			log.Printf("BLE DEBUG [%s] %s: %s", debugLog.Level, debugLog.LogType, debugLog.Message)
 		}
 		
+	case "timeSync":
+		// Time synchronization from Android device
+		var timeSync struct {
+			Type        string `json:"type"`
+			TimestampMs int64  `json:"timestamp_ms"`
+			Timezone    string `json:"timezone,omitempty"`
+		}
+		if err := json.Unmarshal(data, &timeSync); err == nil {
+			log.Printf("BLE_LOG: Received time sync - Timestamp: %d, Timezone: %s", timeSync.TimestampMs, timeSync.Timezone)
+			
+			// Set system time
+			if err := utils.SetSystemTime(timeSync.TimestampMs); err != nil {
+				log.Printf("BLE_LOG: ERROR - Failed to set system time: %v", err)
+			} else {
+				log.Printf("BLE_LOG: System time updated successfully")
+			}
+			
+			// Set timezone if provided
+			if timeSync.Timezone != "" {
+				if err := utils.SetTimezone(timeSync.Timezone); err != nil {
+					log.Printf("BLE_LOG: ERROR - Failed to set timezone: %v", err)
+				} else {
+					log.Printf("BLE_LOG: Timezone updated to: %s", timeSync.Timezone)
+				}
+			}
+			
+			// Broadcast time update event
+			if bc.wsHub != nil {
+				bc.wsHub.Broadcast(utils.WebSocketEvent{
+					Type: "system/time_updated",
+					Payload: map[string]interface{}{
+						"timestamp_ms": timeSync.TimestampMs,
+						"timezone":     timeSync.Timezone,
+					},
+				})
+			}
+		}
+		
 	default:
 		log.Printf("Unknown BLE message type: %s", msgType.Type)
 	}

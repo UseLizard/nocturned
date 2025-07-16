@@ -1086,6 +1086,96 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 	}))
 
+	// GET /media/ble/status
+	http.HandleFunc("/media/ble/status", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		bleClient := btManager.GetBleClient()
+		if bleClient == nil {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"connected": false,
+				"status": "ble_client_not_initialized",
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"connected": bleClient.IsConnected(),
+			"status": func() string {
+				if bleClient.IsConnected() {
+					return "connected"
+				}
+				return "disconnected"
+			}(),
+		})
+	}))
+
+	// POST /media/ble/connect
+	http.HandleFunc("/media/ble/connect", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		bleClient := btManager.GetBleClient()
+		if bleClient == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "BLE client not initialized"})
+			return
+		}
+
+		if bleClient.IsConnected() {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "already_connected"})
+			return
+		}
+
+		// Trigger a new connection attempt in a goroutine
+		go func() {
+			log.Println("Manual BLE connection attempt triggered via API")
+			if err := bleClient.DiscoverAndConnect(); err != nil {
+				log.Printf("Manual BLE connection failed: %v", err)
+			}
+		}()
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "connecting"})
+	}))
+
+	// POST /media/ble/disconnect
+	http.HandleFunc("/media/ble/disconnect", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		bleClient := btManager.GetBleClient()
+		if bleClient == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "BLE client not initialized"})
+			return
+		}
+
+		if !bleClient.IsConnected() {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "already_disconnected"})
+			return
+		}
+
+		bleClient.Disconnect()
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "disconnected"})
+	}))
+
 	// GET /network/status
 	http.HandleFunc("/network/status", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {

@@ -146,3 +146,24 @@ func SetTimezone(timezone string) error {
 
 	return nil
 }
+
+// SetSystemTime sets the system time to the provided Unix timestamp (milliseconds)
+func SetSystemTime(timestampMs int64) error {
+	// Convert milliseconds to seconds
+	seconds := timestampMs / 1000
+	
+	// Format the date command
+	// date -s @<seconds> sets the time from Unix timestamp
+	output, err := ExecuteCommand("date", "-s", fmt.Sprintf("@%d", seconds))
+	if err != nil {
+		return fmt.Errorf("failed to set system time: %v (output: %s)", err, output)
+	}
+	
+	// Sync the hardware clock
+	if output, err := ExecuteCommand("hwclock", "-w"); err != nil {
+		// Log but don't fail if hwclock sync fails
+		fmt.Printf("Warning: failed to sync hardware clock: %v (output: %s)\n", err, output)
+	}
+	
+	return nil
+}
