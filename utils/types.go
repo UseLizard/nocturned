@@ -55,6 +55,7 @@ type MediaCommand struct {
 	CommandID    string `json:"command_id,omitempty"`
 	ValueMs      *int   `json:"value_ms,omitempty"`
 	ValuePercent *int   `json:"value_percent,omitempty"`
+	Payload      map[string]string `json:"payload,omitempty"`
 	Hash         string `json:"hash,omitempty"`
 	Size         int    `json:"size,omitempty"`
 	Data         string `json:"data,omitempty"`

@@ -441,6 +441,14 @@ func (m *BluetoothManager) SendMediaCommand(command string, valueMs *int, valueP
 	return fmt.Errorf("BLE client not connected")
 }
 
+func (m *BluetoothManager) RequestAlbumArt(trackID string, checksum string) error {
+    if m.bleClient != nil && m.bleClient.IsConnected() {
+        log.Printf("Requesting album art for track: %s", trackID)
+        return m.bleClient.SendAlbumArtRequest(trackID, checksum)
+    }
+    return fmt.Errorf("BLE client not connected")
+}
+
 func (m *BluetoothManager) GetMediaState() *utils.MediaStateUpdate {
 	// Get state from whichever client is connected (BLE preferred)
 	if m.bleClient != nil && m.bleClient.IsConnected() {

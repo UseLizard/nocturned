@@ -948,6 +948,48 @@ func main() {
 	}))
 
 	// POST /media/albumart - receive album art from companion app
+	http.HandleFunc("/media/albumart/query", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		var req struct {
+			TrackID  string `json:"track_id"`
+			Checksum string `json:"checksum"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid request body"})
+			return
+		}
+
+		// Check if we already have this album art
+		albumArtDir := "/data/etc/nocturne/albumart"
+		filePath := filepath.Join(albumArtDir, req.Checksum + ".webp")
+
+		if _, err := os.Stat(filePath); err == nil {
+			// We already have it, send an ACK
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "exists"})
+			return
+		}
+
+		// We don't have it, send a NACK to request the full data
+		if err := btManager.RequestAlbumArt(req.TrackID, req.Checksum); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to request album art: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "needed"})
+	}))
+
+
+	// POST /media/albumart - receive album art from companion app
 	http.HandleFunc("/media/albumart", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1084,6 +1126,144 @@ func main() {
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// GET /api/albumart - serve current album art or list gallery
+	http.HandleFunc("/api/albumart", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		// Check if client wants JSON (gallery list)
+		if r.Header.Get("Accept") == "application/json" {
+			// Return list of album art files
+			galleryDir := "/data/etc/nocturne/albumart"
+			
+			type AlbumArtItem struct {
+				Filename string `json:"filename"`
+				Artist   string `json:"artist"`
+				Album    string `json:"album"`
+				Added    string `json:"added"`
+			}
+			
+			response := struct {
+				Files []AlbumArtItem `json:"files"`
+				Count int           `json:"count"`
+			}{
+				Files: []AlbumArtItem{},
+			}
+			
+			// Read directory
+			if entries, err := os.ReadDir(galleryDir); err == nil {
+				for _, entry := range entries {
+					if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".webp") {
+						item := AlbumArtItem{
+							Filename: entry.Name(),
+						}
+						
+						// Try to read metadata
+						metadataFile := filepath.Join(galleryDir, strings.TrimSuffix(entry.Name(), ".webp") + ".json")
+						if data, err := os.ReadFile(metadataFile); err == nil {
+							var metadata map[string]interface{}
+							if json.Unmarshal(data, &metadata) == nil {
+								if artist, ok := metadata["artist"].(string); ok {
+									item.Artist = artist
+								}
+								if album, ok := metadata["album"].(string); ok {
+									item.Album = album
+								}
+								if added, ok := metadata["added"].(string); ok {
+									item.Added = added
+								}
+							}
+						}
+						
+						response.Files = append(response.Files, item)
+					}
+				}
+			}
+			
+			response.Count = len(response.Files)
+			
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+
+		// Serve the current album art file from /tmp/album_art.webp
+		albumArtPath := "/tmp/album_art.webp"
+		
+		// Check if file exists
+		if _, err := os.Stat(albumArtPath); os.IsNotExist(err) {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Album art not found"})
+			return
+		}
+		
+		// Read the file
+		data, err := os.ReadFile(albumArtPath)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to read album art"})
+			return
+		}
+		
+		// Set content type and cache headers
+		w.Header().Set("Content-Type", "image/webp")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		
+		// Write the image data
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	}))
+
+	// GET /api/albumart/{filename} - serve specific album art from gallery
+	http.HandleFunc("/api/albumart/", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		// Extract filename from URL path
+		filename := strings.TrimPrefix(r.URL.Path, "/api/albumart/")
+		
+		// Validate filename (prevent path traversal)
+		if filename == "" || strings.Contains(filename, "..") || strings.Contains(filename, "/") {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid filename"})
+			return
+		}
+		
+		// Construct full path
+		albumArtPath := filepath.Join("/data/etc/nocturne/albumart", filename)
+		
+		// Check if file exists
+		if _, err := os.Stat(albumArtPath); os.IsNotExist(err) {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Album art not found"})
+			return
+		}
+		
+		// Read the file
+		data, err := os.ReadFile(albumArtPath)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to read album art"})
+			return
+		}
+		
+		// Set content type and cache headers (allow caching for gallery items)
+		w.Header().Set("Content-Type", "image/webp")
+		w.Header().Set("Cache-Control", "public, max-age=86400") // Cache for 24 hours
+		
+		// Write the image data
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
 	}))
 
 	// GET /media/ble/status

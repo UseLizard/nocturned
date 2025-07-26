@@ -2,6 +2,7 @@ package utils
 
 import (
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -11,6 +12,12 @@ import (
 // CalculateMD5 calculates the MD5 checksum of the given data
 func CalculateMD5(data []byte) string {
 	hash := md5.Sum(data)
+	return hex.EncodeToString(hash[:])
+}
+
+// CalculateSHA256 calculates the SHA-256 checksum of the given data
+func CalculateSHA256(data []byte) string {
+	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:])
 }
 

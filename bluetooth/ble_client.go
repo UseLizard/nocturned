@@ -1,9 +1,12 @@
 package bluetooth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -1101,24 +1104,54 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 				artStart.TrackID, artStart.Size)
 		}
 		
+	case "album_art_chunk":
+		// Album art chunk data
+		var artChunk struct {
+			Type       string `json:"type"`
+			Checksum   string `json:"checksum"`
+			ChunkIndex int    `json:"chunk_index"`
+			Data       string `json:"data"` // Base64 encoded
+		}
+		if err := json.Unmarshal(data, &artChunk); err == nil {
+			// Decode base64 data
+			chunkData, err := base64.StdEncoding.DecodeString(artChunk.Data)
+			if err != nil {
+				log.Printf("BLE_LOG: Failed to decode album art chunk: %v", err)
+				return
+			}
+			
+			bc.albumArtMutex.Lock()
+			if bc.albumArtReceiving && bc.albumArtChecksum == artChunk.Checksum {
+				bc.albumArtBuffer = append(bc.albumArtBuffer, chunkData...)
+				log.Printf("BLE_LOG: Received album art chunk %d - %d bytes (total: %d/%d)", 
+					artChunk.ChunkIndex, len(chunkData), len(bc.albumArtBuffer), bc.albumArtSize)
+			}
+			bc.albumArtMutex.Unlock()
+		}
+		
 	case "album_art_end":
 		// Album art transfer complete
 		var artEnd struct {
 			Type        string `json:"type"`
-			TrackID     string `json:"track_id"`
 			Checksum    string `json:"checksum"`
-			TotalChunks int    `json:"total_chunks"`
+			Success     bool   `json:"success"`
 		}
 		if err := json.Unmarshal(data, &artEnd); err == nil {
 			bc.albumArtMutex.Lock()
-			if bc.albumArtReceiving && bc.albumArtTrackID == artEnd.TrackID {
-				// Process the completed album art
-				go bc.processAlbumArt()
+			if bc.albumArtReceiving && bc.albumArtChecksum == artEnd.Checksum {
+				if artEnd.Success {
+					// Process the completed album art
+					go bc.processAlbumArt()
+				} else {
+					log.Printf("BLE_LOG: Album art transfer failed for checksum: %s", artEnd.Checksum)
+					bc.albumArtReceiving = false
+					bc.albumArtBuffer = nil
+				}
 			}
 			bc.albumArtMutex.Unlock()
 			
-			log.Printf("BLE_LOG: Album art transfer complete - Track: %s, Chunks: %d", 
-				artEnd.TrackID, artEnd.TotalChunks)
+			log.Printf("BLE_LOG: Album art transfer complete - Checksum: %s, Success: %v", 
+				artEnd.Checksum, artEnd.Success)
 		}
 		
 	default:
@@ -1337,6 +1370,27 @@ func (bc *BleClient) SetVolume(volumePercent int) error {
 	return bc.SendCommand("set_volume", nil, &volumePercent)
 }
 
+func (bc *BleClient) SendAlbumArtRequest(trackID string, checksum string) error {
+    payload := map[string]string{
+        "track_id": trackID,
+        "checksum": checksum,
+    }
+    // This is a special command that doesn't go through the normal queue
+    // because it's a request from nocturned to the companion app.
+    cmd := utils.MediaCommand{
+        Command: "nack_album_art_needed",
+        Payload: payload,
+    }
+    cmdJson, err := json.Marshal(cmd)
+    if err != nil {
+        return fmt.Errorf("failed to marshal album art request: %v", err)
+    }
+
+    charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
+    options := make(map[string]interface{})
+    return charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err
+}
+
 func (bc *BleClient) GetCurrentState() *utils.MediaStateUpdate {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
@@ -1372,8 +1426,8 @@ func (bc *BleClient) processAlbumArt() {
 		return
 	}
 	
-	// Verify checksum
-	checksum := utils.CalculateMD5(bc.albumArtBuffer)
+	// Verify checksum (using SHA-256 to match Android app)
+	    checksum := utils.CalculateSHA256(bc.albumArtBuffer)
 	if checksum != bc.albumArtChecksum {
 		log.Printf("BLE_LOG: Album art checksum mismatch - expected: %s, got: %s", 
 			bc.albumArtChecksum, checksum)
@@ -1381,15 +1435,53 @@ func (bc *BleClient) processAlbumArt() {
 		return
 	}
 	
-	// Save album art to file
-	filename := "/tmp/album_art.webp"
-	if err := utils.SaveAlbumArt(bc.albumArtBuffer, filename); err != nil {
-		log.Printf("BLE_LOG: Failed to save album art: %v", err)
+	// Save album art to temporary location for current playback
+	tempFilename := "/tmp/album_art.webp"
+	if err := utils.SaveAlbumArt(bc.albumArtBuffer, tempFilename); err != nil {
+		log.Printf("BLE_LOG: Failed to save album art to temp: %v", err)
 		bc.albumArtReceiving = false
 		return
 	}
 	
-	log.Printf("BLE_LOG: Album art saved successfully - %s (%d bytes)", filename, len(bc.albumArtBuffer))
+	// Also save to persistent gallery storage
+	galleryDir := "/data/etc/nocturne/albumart"
+	if err := os.MkdirAll(galleryDir, 0755); err != nil {
+		log.Printf("BLE_LOG: Failed to create gallery directory: %v", err)
+	} else {
+		// Use checksum as filename for deduplication
+		galleryFilename := filepath.Join(galleryDir, bc.albumArtChecksum + ".webp")
+		if err := utils.SaveAlbumArt(bc.albumArtBuffer, galleryFilename); err != nil {
+			log.Printf("BLE_LOG: Failed to save album art to gallery: %v", err)
+		} else {
+			// Extract artist and album from current state
+			artist := ""
+			album := ""
+			if bc.currentState != nil {
+				if bc.currentState.Artist != nil {
+					artist = *bc.currentState.Artist
+				}
+				if bc.currentState.Album != nil {
+					album = *bc.currentState.Album
+				}
+			}
+			
+			// Save metadata
+			metadata := map[string]interface{}{
+				"artist": artist,
+				"album": album,
+				"added": time.Now().Format(time.RFC3339),
+			}
+			metadataFile := filepath.Join(galleryDir, bc.albumArtChecksum + ".json")
+			if metadataJSON, err := json.MarshalIndent(metadata, "", "  "); err == nil {
+				if err := os.WriteFile(metadataFile, metadataJSON, 0644); err != nil {
+					log.Printf("BLE_LOG: Failed to save metadata: %v", err)
+				}
+			}
+			log.Printf("BLE_LOG: Album art saved to gallery - %s", galleryFilename)
+		}
+	}
+	
+	log.Printf("BLE_LOG: Album art saved successfully - %s (%d bytes)", tempFilename, len(bc.albumArtBuffer))
 	
 	// Broadcast album art update
 	if bc.wsHub != nil {
@@ -1397,7 +1489,7 @@ func (bc *BleClient) processAlbumArt() {
 			Type: "media/album_art_updated",
 			Payload: map[string]interface{}{
 				"track_id": bc.albumArtTrackID,
-				"filename": filename,
+				"filename": tempFilename,
 				"size":     len(bc.albumArtBuffer),
 			},
 		})
