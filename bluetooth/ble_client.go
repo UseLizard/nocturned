@@ -1005,15 +1005,29 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 
 		// Safe logging with nil checks
 		trackName := "<nil>"
+		artistName := "<nil>"
+		albumName := "<nil>"
 		if stateUpdate.Track != nil {
 			trackName = *stateUpdate.Track
 		}
-		log.Printf("BLE_LOG: Received state update - Track: %s, Playing: %v, Position: %d ms", 
-			trackName, stateUpdate.IsPlaying, stateUpdate.PositionMs)
+		if stateUpdate.Artist != nil {
+			artistName = *stateUpdate.Artist
+		}
+		if stateUpdate.Album != nil {
+			albumName = *stateUpdate.Album
+		}
+		log.Printf("BLE_LOG: Received state update - Track: %s, Artist: %s, Album: %s, Playing: %v, Position: %d ms", 
+			trackName, artistName, albumName, stateUpdate.IsPlaying, stateUpdate.PositionMs)
 
 		bc.mu.Lock()
 		bc.currentState = &stateUpdate
 		bc.mu.Unlock()
+
+		// Check for cached album art
+		if stateUpdate.Artist != nil && stateUpdate.Album != nil && 
+		   *stateUpdate.Artist != "" && *stateUpdate.Album != "" {
+			go bc.checkAndRequestAlbumArt(*stateUpdate.Artist, *stateUpdate.Album)
+		}
 
 		// Broadcast to WebSocket clients
 		if bc.wsHub != nil {
@@ -1397,7 +1411,7 @@ func (bc *BleClient) SendAlbumArtRequest(trackID string, checksum string) error 
     // This is a special command that doesn't go through the normal queue
     // because it's a request from nocturned to the companion app.
     cmd := utils.MediaCommand{
-        Command: "nack_album_art_needed",
+        Command: "album_art_query",
         Payload: payload,
     }
     cmdJson, err := json.Marshal(cmd)
@@ -1405,9 +1419,46 @@ func (bc *BleClient) SendAlbumArtRequest(trackID string, checksum string) error 
         return fmt.Errorf("failed to marshal album art request: %v", err)
     }
 
+    log.Printf("BLE_LOG: Sending album art request for checksum: %s", checksum)
+    
     charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
     options := make(map[string]interface{})
     return charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err
+}
+
+// checkAndRequestAlbumArt checks if album art is cached and requests it if not
+func (bc *BleClient) checkAndRequestAlbumArt(artist, album string) {
+	// Check if album art is already cached
+	if utils.CheckAlbumArtExists(artist, album) {
+		log.Printf("BLE_LOG: Album art already cached for %s - %s", artist, album)
+		
+		// Broadcast that album art is available
+		artPath := utils.GetAlbumArtPath(artist, album)
+		if bc.wsHub != nil {
+			bc.wsHub.Broadcast(utils.WebSocketEvent{
+				Type: "media/album_art_cached",
+				Payload: map[string]interface{}{
+					"artist": artist,
+					"album":  album,
+					"path":   artPath,
+					"cached": true,
+				},
+			})
+		}
+		return
+	}
+	
+	// Generate hash for this artist/album combination
+	hash := utils.GenerateAlbumArtHash(artist, album)
+	log.Printf("BLE_LOG: Album art not cached for %s - %s (hash: %s), requesting from companion", artist, album, hash)
+	
+	// Create a track ID from artist and album
+	trackID := fmt.Sprintf("%s - %s", artist, album)
+	
+	// Request album art from companion app
+	if err := bc.SendAlbumArtRequest(trackID, hash); err != nil {
+		log.Printf("BLE_LOG: Failed to request album art: %v", err)
+	}
 }
 
 func (bc *BleClient) GetCurrentState() *utils.MediaStateUpdate {
@@ -1446,7 +1497,7 @@ func (bc *BleClient) processAlbumArt() {
 	}
 	
 	// Verify checksum (using SHA-256 to match Android app)
-	    checksum := utils.CalculateSHA256(bc.albumArtBuffer)
+	checksum := utils.CalculateSHA256(bc.albumArtBuffer)
 	if checksum != bc.albumArtChecksum {
 		log.Printf("BLE_LOG: Album art checksum mismatch - expected: %s, got: %s", 
 			bc.albumArtChecksum, checksum)
@@ -1454,50 +1505,51 @@ func (bc *BleClient) processAlbumArt() {
 		return
 	}
 	
-	// Save album art to temporary location for current playback
-	tempFilename := "/tmp/album_art.webp"
-	if err := utils.SaveAlbumArt(bc.albumArtBuffer, tempFilename); err != nil {
-		log.Printf("BLE_LOG: Failed to save album art to temp: %v", err)
-		bc.albumArtReceiving = false
-		return
+	// Extract artist and album from current state
+	artist := ""
+	album := ""
+	if bc.currentState != nil {
+		if bc.currentState.Artist != nil {
+			artist = *bc.currentState.Artist
+		}
+		if bc.currentState.Album != nil {
+			album = *bc.currentState.Album
+		}
 	}
 	
-	// Also save to persistent gallery storage
-	galleryDir := "/data/etc/nocturne/albumart"
-	if err := os.MkdirAll(galleryDir, 0755); err != nil {
-		log.Printf("BLE_LOG: Failed to create gallery directory: %v", err)
-	} else {
-		// Use checksum as filename for deduplication
-		galleryFilename := filepath.Join(galleryDir, bc.albumArtChecksum + ".webp")
-		if err := utils.SaveAlbumArt(bc.albumArtBuffer, galleryFilename); err != nil {
-			log.Printf("BLE_LOG: Failed to save album art to gallery: %v", err)
+	// Save album art with hash-based filename for caching
+	if artist != "" && album != "" {
+		// Save to cache with artist/album hash
+		cacheFilename := utils.GetAlbumArtPath(artist, album)
+		if err := utils.SaveAlbumArt(bc.albumArtBuffer, cacheFilename); err != nil {
+			log.Printf("BLE_LOG: Failed to save album art to cache: %v", err)
 		} else {
-			// Extract artist and album from current state
-			artist := ""
-			album := ""
-			if bc.currentState != nil {
-				if bc.currentState.Artist != nil {
-					artist = *bc.currentState.Artist
-				}
-				if bc.currentState.Album != nil {
-					album = *bc.currentState.Album
-				}
-			}
+			log.Printf("BLE_LOG: Album art cached at: %s", cacheFilename)
 			
 			// Save metadata
+			hash := utils.GenerateAlbumArtHash(artist, album)
+			metadataFile := filepath.Join("/data/etc/nocturne/albumart", hash + ".json")
 			metadata := map[string]interface{}{
 				"artist": artist,
 				"album": album,
+				"track": bc.albumArtTrackID,
+				"sha256": checksum,
 				"added": time.Now().Format(time.RFC3339),
 			}
-			metadataFile := filepath.Join(galleryDir, bc.albumArtChecksum + ".json")
 			if metadataJSON, err := json.MarshalIndent(metadata, "", "  "); err == nil {
 				if err := os.WriteFile(metadataFile, metadataJSON, 0644); err != nil {
 					log.Printf("BLE_LOG: Failed to save metadata: %v", err)
 				}
 			}
-			log.Printf("BLE_LOG: Album art saved to gallery - %s", galleryFilename)
 		}
+	}
+	
+	// Also save to temporary location for immediate use
+	tempFilename := "/tmp/album_art.webp"
+	if err := utils.SaveAlbumArt(bc.albumArtBuffer, tempFilename); err != nil {
+		log.Printf("BLE_LOG: Failed to save album art to temp: %v", err)
+		bc.albumArtReceiving = false
+		return
 	}
 	
 	log.Printf("BLE_LOG: Album art saved successfully - %s (%d bytes)", tempFilename, len(bc.albumArtBuffer))
@@ -1508,8 +1560,11 @@ func (bc *BleClient) processAlbumArt() {
 			Type: "media/album_art_updated",
 			Payload: map[string]interface{}{
 				"track_id": bc.albumArtTrackID,
+				"artist":   artist,
+				"album":    album,
 				"filename": tempFilename,
 				"size":     len(bc.albumArtBuffer),
+				"cached":   artist != "" && album != "",
 			},
 		})
 	}

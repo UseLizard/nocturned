@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // CalculateMD5 calculates the MD5 checksum of the given data
@@ -35,4 +36,31 @@ func SaveAlbumArt(data []byte, filename string) error {
 	}
 	
 	return nil
+}
+
+// GenerateAlbumArtHash generates a hash from artist and album names
+func GenerateAlbumArtHash(artist, album string) string {
+	// Normalize strings: lowercase, trim spaces
+	artist = strings.TrimSpace(strings.ToLower(artist))
+	album = strings.TrimSpace(strings.ToLower(album))
+	
+	// Combine artist and album
+	combined := artist + "-" + album
+	
+	// Generate MD5 hash
+	hash := md5.Sum([]byte(combined))
+	return hex.EncodeToString(hash[:])
+}
+
+// GetAlbumArtPath returns the path for cached album art
+func GetAlbumArtPath(artist, album string) string {
+	hash := GenerateAlbumArtHash(artist, album)
+	return filepath.Join("/data/etc/nocturne/albumart", hash + ".webp")
+}
+
+// CheckAlbumArtExists checks if album art is already cached
+func CheckAlbumArtExists(artist, album string) bool {
+	path := GetAlbumArtPath(artist, album)
+	_, err := os.Stat(path)
+	return err == nil
 }
