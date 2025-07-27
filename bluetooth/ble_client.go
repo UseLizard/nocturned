@@ -24,14 +24,8 @@ type CommandQueueItem struct {
 	timestamp    time.Time
 	retryCount   int
 	callback     chan error
-	ackChan      chan error // Channel for ACK signaling
 }
 
-// CommandAck represents acknowledgment from the device
-type CommandAck struct {
-	CommandID string `json:"command_id"`
-	Status    string `json:"status"` // "received" or "success"
-}
 
 type BleClient struct {
 	connected         bool
@@ -59,12 +53,11 @@ type BleClient struct {
 	lastCommandTime   time.Time
 	commandMutex      sync.Mutex
 	
-	// Command queue with ACK handling
+	// Command queue
 	commandQueue      chan *CommandQueueItem
 	commandQueueMu    sync.Mutex
 	activeCommand     *CommandQueueItem
 	lastCommandID     string
-	ackTimeout        time.Duration
 	
 	// Connection state tracking
 	fullyConnected    bool
@@ -91,7 +84,6 @@ func NewBleClient(btManager *BluetoothManager, wsHub *utils.WebSocketHub) *BleCl
 		stopChan:      make(chan struct{}),
 		mtu:           DefaultMTU,
 		commandQueue:  make(chan *CommandQueueItem, 100), // Buffer up to 100 commands
-		ackTimeout:    3 * time.Second,
 	}
 }
 
@@ -518,8 +510,10 @@ func (bc *BleClient) connectBLE() error {
 	// Start command queue processor
 	go bc.processCommandQueue()
 	
-	// Re-enable polling for state updates
-	go bc.startStatePolling()
+	// Disabled polling - it causes notification floods
+	// The polling by reading characteristics triggers the Android app to send notifications
+	// which creates an infinite loop. We'll rely on D-Bus notifications instead.
+	// go bc.startStatePolling()
 
 	log.Printf("BLE GATT connection established to %s", bc.targetAddress)
 	return nil
@@ -955,45 +949,6 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 	
 	// Handle different message types
 	switch msgType.Type {
-			case "ack":
-		// Command acknowledgment
-		var ack CommandAck
-		if err := json.Unmarshal(data, &ack); err == nil {
-			log.Printf("BLE ACK: %s - %s", ack.CommandID, ack.Status)
-			
-			// Handle ACK for active command
-			bc.commandQueueMu.Lock()
-			if bc.activeCommand != nil {
-				log.Printf("BLE_LOG: Checking ACK - received ID: %s, expected ID: %s", ack.CommandID, bc.activeCommand.id)
-				if bc.activeCommand.id == ack.CommandID {
-					// Accept both "received" and "success" status
-					if ack.Status == "received" || ack.Status == "success" {
-						log.Printf("BLE_LOG: Command %s acknowledged with status: %s", bc.activeCommand.command, ack.Status)
-						// Signal ACK received by sending on the channel
-						if bc.activeCommand.ackChan != nil {
-							select {
-							case bc.activeCommand.ackChan <- nil:
-								log.Printf("BLE_LOG: Successfully signaled ACK reception")
-							default:
-								log.Printf("BLE_LOG: WARNING - ACK channel full or closed")
-							}
-						}
-						// Clear active command on success
-						if ack.Status == "success" {
-							bc.activeCommand = nil
-						}
-					} else {
-						log.Printf("BLE_LOG: Unexpected ACK status: %s", ack.Status)
-					}
-				} else {
-					log.Printf("BLE_LOG: ACK ID mismatch - ignoring")
-				}
-			} else {
-				log.Printf("BLE_LOG: Received ACK but no active command - ID: %s, Status: %s", ack.CommandID, ack.Status)
-			}
-			bc.commandQueueMu.Unlock()
-		}
-		
 	case "error":
 		// Error message
 		var errMsg struct {
@@ -1219,7 +1174,6 @@ func (bc *BleClient) SendCommand(command string, valueMs *int, valuePercent *int
 		valuePercent: valuePercent,
 		timestamp:    time.Now(),
 		callback:     make(chan error, 1),
-		ackChan:      make(chan error, 1),
 	}
 	
 	// Add to queue (non-blocking)
@@ -1282,7 +1236,7 @@ func (bc *BleClient) sendCommandImmediate(cmdItem *CommandQueueItem) error {
 		Command:      cmdItem.command,
 		ValueMs:      cmdItem.valueMs,
 		ValuePercent: cmdItem.valuePercent,
-		CommandID:    cmdItem.id, // Include command ID for ACK tracking
+		// No command ID needed without ACK system
 	}
 
 	// Convert command to JSON
@@ -1321,17 +1275,12 @@ func (bc *BleClient) sendCommandImmediate(cmdItem *CommandQueueItem) error {
 		err = charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err
 		if err == nil {
 			bc.lastCommandTime = time.Now()
-			log.Printf("BLE_LOG: Command sent successfully via %s, waiting for ACK...", bc.commandRxCharPath)
-			
-			// Wait for ACK with timeout
-			select {
-			case <-cmdItem.ackChan:
-				log.Printf("BLE_LOG: ACK received for command %s", cmdItem.command)
-				return nil
-			case <-time.After(bc.ackTimeout):
-				log.Printf("BLE_LOG: ACK timeout for command %s", cmdItem.command)
-				return fmt.Errorf("ack timeout for command %s", cmdItem.command)
-			}
+			log.Printf("BLE_LOG: Command sent successfully via %s", bc.commandRxCharPath)
+			// Clear active command immediately after sending
+			bc.commandQueueMu.Lock()
+			bc.activeCommand = nil
+			bc.commandQueueMu.Unlock()
+			return nil
 		}
 		
 		// Check if it's an ATT error
