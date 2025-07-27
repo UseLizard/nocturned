@@ -24,6 +24,7 @@ type CommandQueueItem struct {
 	timestamp    time.Time
 	retryCount   int
 	callback     chan error
+	ackChan      chan error // Channel for ACK signaling
 }
 
 // CommandAck represents acknowledgment from the device
@@ -439,6 +440,9 @@ func (bc *BleClient) connectToDevice() error {
 func (bc *BleClient) connectBLE() error {
 	log.Println("BLE_LOG: connectBLE called")
 
+	// Re-initialize stopChan for new connection
+	bc.stopChan = make(chan struct{})
+
 	// Set device path
 	bc.devicePath = formatDevicePath(bc.btManager.adapter, bc.targetAddress)
 	
@@ -514,10 +518,8 @@ func (bc *BleClient) connectBLE() error {
 	// Start command queue processor
 	go bc.processCommandQueue()
 	
-	// Disabled polling - it causes notification floods
-	// The polling by reading characteristics triggers the Android app to send notifications
-	// which creates an infinite loop. We'll rely on D-Bus notifications instead.
-	// go bc.startStatePolling()
+	// Re-enable polling for state updates
+	go bc.startStatePolling()
 
 	log.Printf("BLE GATT connection established to %s", bc.targetAddress)
 	return nil
@@ -688,6 +690,9 @@ func (bc *BleClient) setupCharacteristics() error {
 		return fmt.Errorf("Response TX characteristic not found")
 	}
 	// Optional characteristics: debugLogCharPath, deviceInfoCharPath
+	
+	log.Printf("BLE_LOG: Characteristics discovered - CommandRx: %s, ResponseTx: %s", 
+		bc.commandRxCharPath, bc.responseTxCharPath)
 	
 	// Read device info if available
 	if bc.deviceInfoCharPath != "" {
@@ -934,6 +939,9 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 		})
 	}
 
+	// Log raw notification data for debugging ACK flow
+	log.Printf("BLE_LOG: Processing notification data: %s", string(data))
+	
 	// Try to parse the message type first
 	var msgType struct {
 		Type string `json:"type"`
@@ -943,9 +951,11 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 		return
 	}
 
+	log.Printf("BLE_LOG: Notification type: %s", msgType.Type)
+	
 	// Handle different message types
 	switch msgType.Type {
-	case "ack":
+			case "ack":
 		// Command acknowledgment
 		var ack CommandAck
 		if err := json.Unmarshal(data, &ack); err == nil {
@@ -953,11 +963,33 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 			
 			// Handle ACK for active command
 			bc.commandQueueMu.Lock()
-			if bc.activeCommand != nil && bc.activeCommand.id == ack.CommandID {
-				if ack.Status == "success" {
-					log.Printf("BLE_LOG: Command %s completed successfully", bc.activeCommand.command)
-					bc.activeCommand = nil
+			if bc.activeCommand != nil {
+				log.Printf("BLE_LOG: Checking ACK - received ID: %s, expected ID: %s", ack.CommandID, bc.activeCommand.id)
+				if bc.activeCommand.id == ack.CommandID {
+					// Accept both "received" and "success" status
+					if ack.Status == "received" || ack.Status == "success" {
+						log.Printf("BLE_LOG: Command %s acknowledged with status: %s", bc.activeCommand.command, ack.Status)
+						// Signal ACK received by sending on the channel
+						if bc.activeCommand.ackChan != nil {
+							select {
+							case bc.activeCommand.ackChan <- nil:
+								log.Printf("BLE_LOG: Successfully signaled ACK reception")
+							default:
+								log.Printf("BLE_LOG: WARNING - ACK channel full or closed")
+							}
+						}
+						// Clear active command on success
+						if ack.Status == "success" {
+							bc.activeCommand = nil
+						}
+					} else {
+						log.Printf("BLE_LOG: Unexpected ACK status: %s", ack.Status)
+					}
+				} else {
+					log.Printf("BLE_LOG: ACK ID mismatch - ignoring")
 				}
+			} else {
+				log.Printf("BLE_LOG: Received ACK but no active command - ID: %s, Status: %s", ack.CommandID, ack.Status)
 			}
 			bc.commandQueueMu.Unlock()
 		}
@@ -1011,12 +1043,18 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 		// Media state update
 		var stateUpdate utils.MediaStateUpdate
 		if err := json.Unmarshal(data, &stateUpdate); err != nil {
-			log.Printf("Failed to parse media state update: %v", err)
+			log.Printf("BLE_LOG: Failed to parse media state update: %v (data: %s)", err, string(data))
+			// Don't disconnect on parse errors - could be MTU truncation
 			return
 		}
 
+		// Safe logging with nil checks
+		trackName := "<nil>"
+		if stateUpdate.Track != nil {
+			trackName = *stateUpdate.Track
+		}
 		log.Printf("BLE_LOG: Received state update - Track: %s, Playing: %v, Position: %d ms", 
-			stateUpdate.Track, stateUpdate.IsPlaying, stateUpdate.PositionMs)
+			trackName, stateUpdate.IsPlaying, stateUpdate.PositionMs)
 
 		bc.mu.Lock()
 		bc.currentState = &stateUpdate
@@ -1163,6 +1201,8 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 func (bc *BleClient) SendCommand(command string, valueMs *int, valuePercent *int) error {
 	bc.mu.RLock()
 	if !bc.connected || bc.targetAddress == "" || !bc.bleConnected || bc.commandRxCharPath == "" {
+		log.Printf("BLE_LOG: Cannot send command - connected:%v, address:%s, bleConnected:%v, cmdPath:%s",
+			bc.connected, bc.targetAddress, bc.bleConnected, bc.commandRxCharPath)
 		bc.mu.RUnlock()
 		return fmt.Errorf("not connected to BLE media device")
 	}
@@ -1179,6 +1219,7 @@ func (bc *BleClient) SendCommand(command string, valueMs *int, valuePercent *int
 		valuePercent: valuePercent,
 		timestamp:    time.Now(),
 		callback:     make(chan error, 1),
+		ackChan:      make(chan error, 1),
 	}
 	
 	// Add to queue (non-blocking)
@@ -1250,10 +1291,23 @@ func (bc *BleClient) sendCommandImmediate(cmdItem *CommandQueueItem) error {
 		return fmt.Errorf("failed to marshal command: %v", err)
 	}
 
-	log.Printf("BLE_LOG: Sending command: %s with ID: %s (JSON: %s)", cmdItem.command, cmdItem.id, string(cmdJson))
+	// Check if command exceeds MTU
+	bc.mu.RLock()
+	currentMTU := bc.mtu
+	bc.mu.RUnlock()
+	
+	effectiveMTU := int(currentMTU - MTUHeaderSize)
+	if len(cmdJson) > effectiveMTU {
+		log.Printf("BLE_LOG: WARNING - Command size %d exceeds MTU %d, may fail", len(cmdJson), effectiveMTU)
+		// For now, still try to send but log the warning
+		// In the future, implement command chunking or compression
+	}
+
+	log.Printf("BLE_LOG: Sending command: %s with ID: %s (size: %d bytes)", cmdItem.command, cmdItem.id, len(cmdJson))
 
 	// Send using D-Bus
 	charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
+	// BlueZ options for WriteValue - empty map uses default write with response
 	options := make(map[string]interface{})
 	
 	// Try to send
@@ -1267,18 +1321,34 @@ func (bc *BleClient) sendCommandImmediate(cmdItem *CommandQueueItem) error {
 		err = charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err
 		if err == nil {
 			bc.lastCommandTime = time.Now()
-			log.Printf("BLE_LOG: Command sent successfully, waiting for ACK...")
+			log.Printf("BLE_LOG: Command sent successfully via %s, waiting for ACK...", bc.commandRxCharPath)
 			
-			// For now, we'll proceed without waiting for ACK
-			// TODO: Implement proper ACK waiting with channel communication
-			// This would involve waiting for the ACK to be received in handleNotificationData
-			// and signaling completion via a channel
-			return nil
+			// Wait for ACK with timeout
+			select {
+			case <-cmdItem.ackChan:
+				log.Printf("BLE_LOG: ACK received for command %s", cmdItem.command)
+				return nil
+			case <-time.After(bc.ackTimeout):
+				log.Printf("BLE_LOG: ACK timeout for command %s", cmdItem.command)
+				return fmt.Errorf("ack timeout for command %s", cmdItem.command)
+			}
 		}
 		
 		// Check if it's an ATT error
 		if strings.Contains(err.Error(), "ATT error: 0x0e") {
 			log.Printf("BLE_LOG: ATT error 0x0e - characteristic busy, will retry")
+			continue
+		}
+		
+		// Check for "In Progress" error
+		if strings.Contains(err.Error(), "InProgress") || strings.Contains(err.Error(), "In Progress") {
+			log.Printf("BLE_LOG: Operation in progress, clearing state and retrying...")
+			// Clear the active command to allow recovery
+			bc.commandQueueMu.Lock()
+			bc.activeCommand = nil
+			bc.commandQueueMu.Unlock()
+			// Add a longer delay before retry
+			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 		
@@ -1617,7 +1687,12 @@ func (bc *BleClient) Disconnect() {
 
 		// Stop monitoring
 		if bc.stopChan != nil {
-			close(bc.stopChan)
+			select {
+			case <-bc.stopChan:
+				// Channel already closed
+			default:
+				close(bc.stopChan)
+			}
 		}
 
 		// Stop notifications if enabled
