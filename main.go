@@ -10,10 +10,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -138,7 +140,189 @@ func networkChecker(hub *utils.WebSocketHub) {
 
 var currentNetworkStatus = "offline"
 
+// Global in-memory album art storage
+var (
+	currentAlbumArt      []byte
+	currentAlbumArtMutex sync.RWMutex
+)
+
+// SetCurrentAlbumArt updates the global in-memory album art
+func SetCurrentAlbumArt(data []byte) {
+	currentAlbumArtMutex.Lock()
+	// Make a copy to avoid external modifications
+	if data != nil {
+		currentAlbumArt = make([]byte, len(data))
+		copy(currentAlbumArt, data)
+	} else {
+		currentAlbumArt = nil
+	}
+	currentAlbumArtMutex.Unlock()
+}
+
+// GetCurrentAlbumArt returns the current in-memory album art
+func GetCurrentAlbumArt() []byte {
+	currentAlbumArtMutex.RLock()
+	defer currentAlbumArtMutex.RUnlock()
+	// Return the actual data - the HTTP handler will write it directly
+	// This avoids an unnecessary copy
+	return currentAlbumArt
+}
+
+// waitForFilesystem waits for filesystem to be ready
+func waitForFilesystem() error {
+	maxRetries := 30
+	testFile := "/var/.nocturne_test"
+	
+	for i := 0; i < maxRetries; i++ {
+		// Try to write a test file
+		if err := os.WriteFile(testFile, []byte("test"), 0644); err == nil {
+			// Clean up test file
+			os.Remove(testFile)
+			log.Printf("Filesystem ready after %d seconds", i)
+			return nil
+		}
+		
+		if i == 0 {
+			log.Printf("Waiting for filesystem to be ready...")
+		}
+		time.Sleep(1 * time.Second)
+	}
+	
+	return fmt.Errorf("filesystem not ready after %d seconds", maxRetries)
+}
+
+// setupAlbumArtDirectory creates the album art directory in /var which is writable
+// disconnectExistingBLEConnections disconnects any active BLE connections
+func disconnectExistingBLEConnections() {
+	log.Println("Checking for existing BLE connections...")
+	
+	// Use bluetoothctl to disconnect any connected devices
+	cmd := exec.Command("bluetoothctl", "disconnect")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// This is okay - it just means no device was connected
+		log.Printf("No active BLE connections to disconnect")
+	} else {
+		log.Printf("Disconnected existing BLE connection: %s", strings.TrimSpace(string(output)))
+		// Wait a moment for disconnect to complete
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// optimizeBLEParameters sets optimal BLE connection parameters before any connections
+func optimizeBLEParameters() {
+	log.Println("Setting optimal BLE connection parameters...")
+	
+	debugPath := "/sys/kernel/debug/bluetooth/hci0"
+	
+	// Check if debugfs is available
+	if _, err := os.Stat(debugPath); os.IsNotExist(err) {
+		log.Println("Debug filesystem not available, trying to mount...")
+		// Try to mount debugfs
+		if err := syscall.Mount("none", "/sys/kernel/debug", "debugfs", 0, ""); err != nil {
+			log.Printf("Failed to mount debugfs: %v", err)
+		}
+	}
+	
+	// First, disconnect any existing BLE connections
+	// This ensures new connections will use the optimized parameters
+	disconnectExistingBLEConnections()
+	
+	// Optimal parameters for low latency
+	params := map[string]string{
+		"conn_min_interval": "6",    // 7.5ms
+		"conn_max_interval": "12",   // 15ms
+		"conn_latency": "0",         // No slave latency
+		"supervision_timeout": "500", // 5 seconds
+	}
+	
+	successCount := 0
+	for param, value := range params {
+		path := fmt.Sprintf("%s/%s", debugPath, param)
+		if err := os.WriteFile(path, []byte(value+"\n"), 0644); err != nil {
+			log.Printf("Cannot set %s: %v", param, err)
+		} else {
+			log.Printf("Set %s to %s", param, value)
+			successCount++
+		}
+	}
+	
+	if successCount > 0 {
+		log.Printf("Successfully optimized %d BLE parameters for fast album art transfers", successCount)
+		log.Println("Connection intervals: 7.5-15ms (vs default 50-70ms)")
+	} else {
+		log.Println("Could not optimize BLE parameters - transfers may be slower")
+	}
+}
+
+func setupAlbumArtDirectory() error {
+	albumArtDir := "/var/nocturne/albumart"
+	
+	// Retry directory creation with exponential backoff
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = os.MkdirAll(albumArtDir, 0755); err == nil {
+			break
+		}
+		
+		log.Printf("Failed to create album art directory (attempt %d/5): %v", attempt+1, err)
+		time.Sleep(time.Duration(1<<uint(attempt)) * time.Second) // Exponential backoff
+	}
+	
+	if err != nil {
+		// Don't fail hard - album art is not critical
+		log.Printf("WARNING: Could not create album art directory: %v - album art will be disabled", err)
+		return nil
+	}
+	
+	// Count existing album art files
+	files, err := os.ReadDir(albumArtDir)
+	if err == nil {
+		count := 0
+		for _, file := range files {
+			if !file.IsDir() && strings.HasSuffix(file.Name(), ".webp") {
+				count++
+			}
+		}
+		if count > 0 {
+			log.Printf("Found %d existing album art files in %s", count, albumArtDir)
+		}
+	}
+	
+	log.Printf("Album art directory ready at: %s (persistent storage on /var)", albumArtDir)
+	return nil
+}
+
+
 func main() {
+	// Wait for filesystem to be ready before any file operations
+	if err := waitForFilesystem(); err != nil {
+		log.Printf("WARNING: %v - continuing with limited functionality", err)
+	}
+	
+	// Set up file logging
+	logDir := "/var/nocturne"
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Printf("Warning: Could not create log directory %s: %v", logDir, err)
+	}
+	
+	// TEMPORARILY DISABLED FILE LOGGING FOR PERFORMANCE TESTING
+	if true {
+		logFile, err := os.OpenFile(filepath.Join(logDir, "nocturned.log"), 
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Printf("Warning: Could not open log file: %v", err)
+			// Continue with stdout logging only
+		} else {
+			// Log to both file and stdout
+			multiWriter := io.MultiWriter(os.Stdout, logFile)
+			log.SetOutput(multiWriter)
+			defer logFile.Close()
+			log.Println("Logging to /var/nocturne/nocturned.log")
+		}
+	}
+	log.Println("File logging disabled for performance testing")
+
 	// Protect the process from supervisor interference
 	// Create a new process group to isolate from supervisor signals
 	if os.Getenv("UNDER_SUPERVISOR") != "" {
@@ -146,11 +330,24 @@ func main() {
 		syscall.Setpgid(0, 0)
 	}
 
+	// Set up album art directory with tmpfs
+	if err := setupAlbumArtDirectory(); err != nil {
+		log.Printf("Failed to set up album art directory: %v", err)
+	}
+
+	// Optimize BLE connection parameters BEFORE any connections
+	optimizeBLEParameters()
+
 	wsHub := utils.NewWebSocketHub()
 
 	btManager, err := bluetooth.NewBluetoothManager(wsHub)
 	if err != nil {
 		log.Fatal("Failed to initialize bluetooth manager:", err)
+	}
+	
+	// Set the album art callback to store in memory immediately
+	if bleClient := btManager.GetBleClient(); bleClient != nil {
+		bleClient.SetAlbumArtCallback(SetCurrentAlbumArt)
 	}
 
 	if err := utils.InitBrightness(); err != nil {
@@ -967,7 +1164,7 @@ func main() {
 		}
 
 		// Check if we already have this album art
-		albumArtDir := "/data/etc/nocturne/albumart"
+		albumArtDir := "/var/nocturne/albumart"
 		filePath := filepath.Join(albumArtDir, req.Checksum + ".webp")
 
 		if _, err := os.Stat(filePath); err == nil {
@@ -1033,7 +1230,7 @@ func main() {
 		hashStr := hex.EncodeToString(hash[:])
 
 		// Create album art directory if it doesn't exist
-		albumArtDir := "/data/etc/nocturne/albumart"
+		albumArtDir := "/var/nocturne/albumart"
 		if err := os.MkdirAll(albumArtDir, 0755); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to create album art directory: " + err.Error()})
@@ -1139,7 +1336,7 @@ func main() {
 		// Check if client wants JSON (gallery list)
 		if r.Header.Get("Accept") == "application/json" {
 			// Return list of album art files
-			galleryDir := "/data/etc/nocturne/albumart"
+			galleryDir := "/var/nocturne/albumart"
 			
 			type AlbumArtItem struct {
 				Filename string `json:"filename"`
@@ -1158,13 +1355,20 @@ func main() {
 			// Read directory
 			if entries, err := os.ReadDir(galleryDir); err == nil {
 				for _, entry := range entries {
-					if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".webp") {
+					if !entry.IsDir() && (strings.HasSuffix(entry.Name(), ".jpg") || strings.HasSuffix(entry.Name(), ".webp")) {
 						item := AlbumArtItem{
 							Filename: entry.Name(),
 						}
 						
 						// Try to read metadata
-						metadataFile := filepath.Join(galleryDir, strings.TrimSuffix(entry.Name(), ".webp") + ".json")
+						// Handle both .jpg and .webp files
+						baseName := entry.Name()
+						if strings.HasSuffix(baseName, ".jpg") {
+							baseName = strings.TrimSuffix(baseName, ".jpg")
+						} else if strings.HasSuffix(baseName, ".webp") {
+							baseName = strings.TrimSuffix(baseName, ".webp")
+						}
+						metadataFile := filepath.Join(galleryDir, baseName + ".json")
 						if data, err := os.ReadFile(metadataFile); err == nil {
 							var metadata map[string]interface{}
 							if json.Unmarshal(data, &metadata) == nil {
@@ -1192,26 +1396,44 @@ func main() {
 			return
 		}
 
-		// Serve the current album art file from /tmp/album_art.webp
-		albumArtPath := "/tmp/album_art.webp"
+		// Log when album art is requested
+		log.Printf("Album art requested at %s", time.Now().Format("15:04:05.000"))
 		
-		// Check if file exists
-		if _, err := os.Stat(albumArtPath); os.IsNotExist(err) {
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(ErrorResponse{Error: "Album art not found"})
-			return
+		// First check if we have album art in memory
+		data := GetCurrentAlbumArt()
+		
+		if data == nil {
+			log.Printf("No album art in memory, checking disk...")
+			// Fall back to reading from disk
+			albumArtPath := "/tmp/album_art.jpg"
+			
+			// Check if file exists (no retry needed with synchronous processing)
+			_, statErr := os.Stat(albumArtPath)
+			
+			if os.IsNotExist(statErr) {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Album art not found"})
+				return
+			}
+			
+			// Read the file (no retry needed with synchronous processing)
+			var readErr error
+			data, readErr = os.ReadFile(albumArtPath)
+			
+			if readErr != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to read album art"})
+				return
+			}
+		} else {
+			log.Printf("Serving album art from memory (%d bytes)", len(data))
 		}
 		
-		// Read the file
-		data, err := os.ReadFile(albumArtPath)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to read album art"})
-			return
-		}
+		// Detect image format from data
+		contentType := detectImageFormat(data)
 		
 		// Set content type and cache headers
-		w.Header().Set("Content-Type", "image/webp")
+		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
@@ -1240,7 +1462,7 @@ func main() {
 		}
 		
 		// Construct full path
-		albumArtPath := filepath.Join("/data/etc/nocturne/albumart", filename)
+		albumArtPath := filepath.Join("/var/nocturne/albumart", filename)
 		
 		// Check if file exists
 		if _, err := os.Stat(albumArtPath); os.IsNotExist(err) {
@@ -1260,6 +1482,109 @@ func main() {
 		// Set content type and cache headers (allow caching for gallery items)
 		w.Header().Set("Content-Type", "image/webp")
 		w.Header().Set("Cache-Control", "public, max-age=86400") // Cache for 24 hours
+		
+		// Write the image data
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	}))
+
+	// POST /api/test/album-art/request - test endpoint to request album art for testing
+	http.HandleFunc("/api/test/album-art/request", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		bleClient := btManager.GetBleClient()
+		if bleClient == nil || !bleClient.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "BLE not connected"})
+			return
+		}
+
+		// Send test album art request command
+		err := bleClient.SendTestAlbumArtRequest()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send test album art request: " + err.Error()})
+			return
+		}
+
+		// Notify WebSocket clients that test transfer is starting
+		wsHub.Broadcast(utils.WebSocketEvent{
+			Type:    "test/album_art_requested",
+			Payload: map[string]interface{}{
+				"timestamp": time.Now().UnixMilli(),
+			},
+		})
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "requested"})
+	}))
+
+	// GET /api/test/album-art/status - get test transfer status
+	http.HandleFunc("/api/test/album-art/status", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		bleClient := btManager.GetBleClient()
+		if bleClient == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "BLE not initialized"})
+			return
+		}
+
+		status := bleClient.GetTestTransferStatus()
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(status)
+	}))
+
+	// GET /api/test/album-art/image - serve test album art
+	http.HandleFunc("/api/test/album-art/image", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		// Log when test album art is requested
+		log.Printf("Test album art requested at %s", time.Now().Format("15:04:05.000"))
+		
+		// Check test album art location
+		testAlbumArtPath := "/tmp/test_album_art.jpg"
+		
+		// Check if file exists
+		_, statErr := os.Stat(testAlbumArtPath)
+		
+		if os.IsNotExist(statErr) {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Test album art not found"})
+			return
+		}
+		
+		// Read the file
+		data, readErr := os.ReadFile(testAlbumArtPath)
+		
+		if readErr != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to read test album art"})
+			return
+		}
+		
+		log.Printf("Serving test album art (%d bytes)", len(data))
+		
+		// Detect image format from data
+		contentType := detectImageFormat(data)
+		
+		// Set content type and cache headers
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
 		
 		// Write the image data
 		w.WriteHeader(http.StatusOK)
@@ -1582,6 +1907,73 @@ func main() {
 		}
 	}))
 
+	// POST /api/bluetooth/disconnect - Disconnect BLE for reconnection
+	http.HandleFunc("/api/bluetooth/disconnect", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		// Disconnect BLE
+		if bleClient := btManager.GetBleClient(); bleClient != nil {
+			bleClient.Disconnect()
+			log.Println("BLE disconnected for reconnection")
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "disconnected"})
+	}))
+
+	// POST /api/time/sync - Request time sync from companion
+	http.HandleFunc("/api/time/sync", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		// Send time sync request via BLE
+		if bleClient := btManager.GetBleClient(); bleClient != nil {
+			if err := bleClient.SendCommand("request_time_sync", nil, nil); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to request time sync: " + err.Error()})
+				return
+			}
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "BLE not connected"})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "time_sync_requested"})
+	}))
+
+	// POST /api/device/reboot - Reboot the device
+	http.HandleFunc("/api/device/reboot", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "rebooting"})
+
+		// Give time for response to be sent
+		go func() {
+			time.Sleep(1 * time.Second)
+			log.Println("Rebooting device...")
+			// Use syscall to reboot
+			if err := syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART); err != nil {
+				log.Printf("Failed to reboot: %v", err)
+				// Try alternative method
+				exec.Command("reboot").Run()
+			}
+		}()
+	}))
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "5000"
@@ -1594,4 +1986,31 @@ func main() {
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// detectImageFormat detects the image format from the data bytes
+func detectImageFormat(data []byte) string {
+	if len(data) < 12 {
+		return "application/octet-stream"
+	}
+	
+	// Check for JPEG (starts with FF D8 FF)
+	if data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return "image/jpeg"
+	}
+	
+	// Check for PNG (starts with 89 50 4E 47 0D 0A 1A 0A)
+	if data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 &&
+		data[4] == 0x0D && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A {
+		return "image/png"
+	}
+	
+	// Check for WebP (starts with RIFF....WEBP)
+	if data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 &&
+		data[8] == 0x57 && data[9] == 0x45 && data[10] == 0x42 && data[11] == 0x50 {
+		return "image/webp"
+	}
+	
+	// Default to JPEG if unknown
+	return "image/jpeg"
 }

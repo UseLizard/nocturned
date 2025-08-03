@@ -5,6 +5,22 @@ sv check dbus > /dev/null || exit 1
 sv check bluetoothd > /dev/null || exit 1  
 sv check bluetooth_adapter > /dev/null || exit 1
 
+# Wait for filesystems to be fully mounted and writable
+# This is critical for car power scenarios where boot is slower
+echo "Waiting for filesystems..."
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if touch /var/.test 2>/dev/null; then
+        rm -f /var/.test
+        echo "Filesystem ready after $i seconds"
+        break
+    fi
+    sleep 1
+done
+
+# Give system time to stabilize after filesystem mount
+# This helps with power-constrained environments
+sleep 3
+
 # Give Bluetooth hardware extra time to fully initialize after btattach
 sleep 5
 
@@ -16,4 +32,6 @@ for i in 1 2 3 4 5; do
     sleep 2
 done
 
-exec /usr/local/bin/nocturned > /dev/null 2>&1
+# Start nocturned with output for debugging
+# Remove "> /dev/null 2>&1" to see logs in runsv
+exec /usr/local/bin/nocturned

@@ -1,8 +1,9 @@
 package utils
 
 import (
-	"log"
+	//"log"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -35,22 +36,44 @@ func (h *WebSocketHub) RemoveClient(conn *websocket.Conn) {
 
 func (h *WebSocketHub) Broadcast(event WebSocketEvent) {
 	h.mu.Lock()
-	var clientsToRemove []*websocket.Conn
-
+	// Create a snapshot of current clients
+	clients := make([]*websocket.Conn, 0, len(h.clients))
 	for conn := range h.clients {
-		if err := conn.WriteJSON(event); err != nil {
-			log.Printf("Client disconnected: %v", err)
-			clientsToRemove = append(clientsToRemove, conn)
-			continue
-		}
+		clients = append(clients, conn)
 	}
 	h.mu.Unlock()
 
-	if len(clientsToRemove) > 0 {
+	// Send to each client asynchronously
+	var wg sync.WaitGroup
+	var failedClients []*websocket.Conn
+	var failedMu sync.Mutex
+
+	for _, conn := range clients {
+		wg.Add(1)
+		go func(c *websocket.Conn) {
+			defer wg.Done()
+			
+			// Set write deadline to prevent slow clients from blocking too long
+			c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+			if err := c.WriteJSON(event); err != nil {
+				failedMu.Lock()
+				failedClients = append(failedClients, c)
+				failedMu.Unlock()
+			}
+		}(conn)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+
+	// Remove failed clients
+	if len(failedClients) > 0 {
 		h.mu.Lock()
-		for _, conn := range clientsToRemove {
-			delete(h.clients, conn)
-			conn.Close()
+		for _, conn := range failedClients {
+			if _, ok := h.clients[conn]; ok {
+				delete(h.clients, conn)
+				conn.Close()
+			}
 		}
 		h.mu.Unlock()
 	}
