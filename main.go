@@ -1950,6 +1950,31 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "time_sync_requested"})
 	}))
 
+	// POST /api/track/refresh - Request track data refresh from companion
+	http.HandleFunc("/api/track/refresh", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		// Send track refresh request via BLE
+		if bleClient := btManager.GetBleClient(); bleClient != nil {
+			if err := bleClient.SendCommand("request_track_refresh", nil, nil); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to request track refresh: " + err.Error()})
+				return
+			}
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "BLE not connected"})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "track_refresh_requested"})
+	}))
+
 	// POST /api/device/reboot - Reboot the device
 	http.HandleFunc("/api/device/reboot", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {

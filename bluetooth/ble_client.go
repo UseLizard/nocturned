@@ -926,11 +926,51 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 					charType = "debug"
 					log.Printf("BLE_LOG: Received notification on Debug Log characteristic")
 				} else {
-					// Log other signals for debugging
-					if strings.Contains(string(sig.Path), string(bc.devicePath)) {
-						log.Printf("BLE_LOG: Received signal on path %s (not our characteristic)", sig.Path)
+					// It's not a notification on a characteristic we're watching.
+					// Check if it's a UUIDs property change on the device itself, which can cause connection instability.
+					if sig.Path == bc.devicePath {
+						if len(sig.Body) >= 2 {
+							// sig.Body[0] is the interface name (string)
+							// sig.Body[1] is the changed properties (map[string]dbus.Variant)
+							if interfaceName, ok := sig.Body[0].(string); ok && interfaceName == BLUEZ_DEVICE_INTERFACE {
+								if changedProps, ok := sig.Body[1].(map[string]dbus.Variant); ok {
+									if _, exists := changedProps["UUIDs"]; exists {
+										log.Printf("BLE_LOG: Device services changed (UUIDs property). This can disrupt the connection. Re-validating GATT profile.")
+										
+										// This needs to be handled carefully to avoid race conditions.
+										// We'll trigger a soft-reconnect in a separate goroutine.
+										go func() {
+											bc.mu.Lock()
+											defer bc.mu.Unlock()
+
+											log.Println("BLE_LOG: Attempting to re-validate GATT services and characteristics...")
+											if err := bc.discoverGattService(); err != nil {
+												log.Printf("BLE_LOG: Failed to re-discover GATT service after UUID change: %v. Triggering full reconnect.", err)
+												// Use a goroutine to avoid deadlock on the lock
+												go bc.handleConnectionLoss()
+												return
+											}
+											if err := bc.setupCharacteristics(); err != nil {
+												log.Printf("BLE_LOG: Failed to re-setup characteristics after UUID change: %v. Triggering full reconnect.", err)
+												go bc.handleConnectionLoss()
+												return
+											}
+											log.Printf("BLE_LOG: Successfully re-validated GATT profile after UUID change.")
+										}()
+										
+										// We've handled this signal, so we can continue the loop.
+										continue
+									}
+								}
+							}
+						}
 					}
-					continue // Not our characteristic
+
+					// Log other unhandled signals for debugging if they are on our device path
+					if strings.Contains(string(sig.Path), string(bc.devicePath)) {
+						log.Printf("BLE_LOG: Received unhandled signal on path %s: Name=%s, Body=%v", sig.Path, sig.Name, sig.Body)
+					}
+					continue
 				}
 				
 				// The signal has format: interface_name, changed_properties, invalidated_properties
