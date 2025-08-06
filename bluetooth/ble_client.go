@@ -1668,6 +1668,17 @@ func (bc *BleClient) SetVolume(volumePercent int) error {
 	return bc.SendCommand("set_volume", nil, &volumePercent)
 }
 
+// UpdateLocalVolume updates the local state volume without sending to device
+func (bc *BleClient) UpdateLocalVolume(volumePercent int) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	
+	if bc.currentState != nil {
+		bc.currentState.VolumePercent = volumePercent
+		log.Printf("BLE_LOG: Updated local volume state to %d%%", volumePercent)
+	}
+}
+
 func (bc *BleClient) SendAlbumArtRequest(trackID string, checksum string) error {
     payload := map[string]string{
         "track_id": trackID,

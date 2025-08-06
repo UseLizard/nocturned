@@ -449,6 +449,13 @@ func (m *BluetoothManager) RequestAlbumArt(trackID string, checksum string) erro
     return fmt.Errorf("BLE client not connected")
 }
 
+// UpdateLocalVolume updates the local state volume without sending to device
+func (m *BluetoothManager) UpdateLocalVolume(volumePercent int) {
+	if m.bleClient != nil {
+		m.bleClient.UpdateLocalVolume(volumePercent)
+	}
+}
+
 func (m *BluetoothManager) GetMediaState() *utils.MediaStateUpdate {
 	// Get state from whichever client is connected (BLE preferred)
 	if m.bleClient != nil && m.bleClient.IsConnected() {

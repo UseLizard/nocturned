@@ -1134,12 +1134,25 @@ func main() {
 			return
 		}
 
-		if err := btManager.SendMediaCommand("set_volume", nil, &volume); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send volume command: " + err.Error()})
-			return
+		// Update local state immediately for instant UI feedback
+		btManager.UpdateLocalVolume(volume)
+		
+		// Broadcast the updated state via WebSocket
+		if state := btManager.GetMediaState(); state != nil {
+			wsHub.Broadcast(utils.WebSocketEvent{
+				Type:    "media/state_update",
+				Payload: state,
+			})
 		}
+		
+		// Send volume command to Android asynchronously
+		go func() {
+			if err := btManager.SendMediaCommand("set_volume", nil, &volume); err != nil {
+				log.Printf("Failed to send volume command: %v", err)
+			}
+		}()
 
+		// Return success immediately for responsive UI
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 	}))
