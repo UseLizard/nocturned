@@ -22,6 +22,17 @@ const (
 	MsgTestAlbumArtStart  uint16 = 0x0200
 	MsgTestAlbumArtChunk  uint16 = 0x0201
 	MsgTestAlbumArtEnd    uint16 = 0x0202
+	
+	// Incremental state update message types
+	MsgStateArtist      uint16 = 0x0300 // Deprecated - use MsgStateArtistAlbum
+	MsgStateAlbum       uint16 = 0x0301 // Deprecated - use MsgStateArtistAlbum
+	MsgStateTrack       uint16 = 0x0302
+	MsgStatePosition    uint16 = 0x0303
+	MsgStateDuration    uint16 = 0x0304
+	MsgStatePlayState   uint16 = 0x0305
+	MsgStateVolume      uint16 = 0x0306
+	MsgStateFull        uint16 = 0x0307
+	MsgStateArtistAlbum uint16 = 0x0308 // Combined artist+album update
 )
 
 // BinaryHeader represents the 16-byte header for all binary messages
@@ -210,4 +221,71 @@ func BytesToHex(bytes []byte) string {
 		hex += fmt.Sprintf("%02x", b)
 	}
 	return hex
+}
+
+// ParseStringPayload extracts a UTF-8 string from binary payload
+func ParseStringPayload(data []byte) string {
+	return string(data)
+}
+
+// ParseLongPayload extracts an int64 from binary payload (8 bytes, big-endian)
+func ParseLongPayload(data []byte) (int64, error) {
+	if len(data) < 8 {
+		return 0, fmt.Errorf("insufficient data for long: %d bytes", len(data))
+	}
+	return int64(binary.BigEndian.Uint64(data[:8])), nil
+}
+
+// ParseBooleanPayload extracts a boolean from binary payload (1 byte)
+func ParseBooleanPayload(data []byte) (bool, error) {
+	if len(data) < 1 {
+		return false, fmt.Errorf("insufficient data for boolean")
+	}
+	return data[0] != 0, nil
+}
+
+// ParseBytePayload extracts a byte from binary payload
+func ParseBytePayload(data []byte) (byte, error) {
+	if len(data) < 1 {
+		return 0, fmt.Errorf("insufficient data for byte")
+	}
+	return data[0], nil
+}
+
+// ParseArtistAlbumPayload extracts artist and album from combined binary payload
+// Format: [artist_length:2][artist:N][album_length:2][album:M]
+func ParseArtistAlbumPayload(data []byte) (string, string, error) {
+	if len(data) < 4 {
+		return "", "", fmt.Errorf("insufficient data for artist+album: %d bytes", len(data))
+	}
+	
+	buf := bytes.NewReader(data)
+	
+	// Read artist length
+	var artistLen uint16
+	if err := binary.Read(buf, binary.BigEndian, &artistLen); err != nil {
+		return "", "", fmt.Errorf("failed to read artist length: %v", err)
+	}
+	
+	// Read artist
+	artistBytes := make([]byte, artistLen)
+	if _, err := buf.Read(artistBytes); err != nil {
+		return "", "", fmt.Errorf("failed to read artist data: %v", err)
+	}
+	artist := string(artistBytes)
+	
+	// Read album length
+	var albumLen uint16
+	if err := binary.Read(buf, binary.BigEndian, &albumLen); err != nil {
+		return "", "", fmt.Errorf("failed to read album length: %v", err)
+	}
+	
+	// Read album
+	albumBytes := make([]byte, albumLen)
+	if _, err := buf.Read(albumBytes); err != nil {
+		return "", "", fmt.Errorf("failed to read album data: %v", err)
+	}
+	album := string(albumBytes)
+	
+	return artist, album, nil
 }

@@ -1041,8 +1041,8 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 		return
 	}
 
-	// Check if this is binary protocol data (album art characteristic)
-	if charType == "albumart" && len(data) >= BinaryHeaderSize {
+	// Check if this is binary protocol data (album art or response characteristic)
+	if (charType == "albumart" || charType == "response") && len(data) >= BinaryHeaderSize {
 		// Try to parse as binary protocol
 		header, payload, err := ParseBinaryMessage(data)
 		if err == nil {
@@ -1096,21 +1096,24 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 			DebugEnabled          bool     `json:"debug_enabled"`
 			BinaryProtocol        bool     `json:"binary_protocol"`
 			BinaryProtocolVersion int      `json:"binary_protocol_version"`
+			IncrementalUpdates    bool     `json:"incremental_updates"`
 		}
 		if err := json.Unmarshal(data, &caps); err == nil {
 			log.Printf("BLE Capabilities: Version %s, MTU %d, Features: %v, Binary Protocol: %v", 
 				caps.Version, caps.MTU, caps.Features, caps.BinaryProtocol)
 			
-			// Check if binary protocol is supported
-			if caps.BinaryProtocol && caps.BinaryProtocolVersion >= 1 {
-				log.Printf("BLE_LOG: Device supports binary protocol v%d, enabling...", caps.BinaryProtocolVersion)
-				// Enable binary protocol
+			// Check if incremental updates are supported
+			if caps.IncrementalUpdates {
+				log.Printf("BLE_LOG: Device supports incremental updates, enabling...")
+				// Enable binary incremental updates
 				go func() {
 					time.Sleep(100 * time.Millisecond) // Small delay to ensure connection is stable
 					if err := bc.enableBinaryProtocol(); err != nil {
-						log.Printf("BLE_LOG: Failed to enable binary protocol: %v", err)
+						log.Printf("BLE_LOG: Failed to enable binary incremental updates: %v", err)
 					}
 				}()
+			} else if caps.BinaryProtocol && caps.BinaryProtocolVersion >= 1 {
+				log.Printf("BLE_LOG: Device supports binary protocol v%d but not incremental updates", caps.BinaryProtocolVersion)
 			}
 			// Update our MTU if provided
 			if caps.MTU > 0 {
@@ -2170,16 +2173,148 @@ func (bc *BleClient) handleBinaryMessage(header *BinaryHeader, payload []byte) {
 			log.Printf("BLE_LOG: Test album art end checksum mismatch")
 		}
 		
+	// Incremental state update messages
+	case MsgStateArtist:
+		// Deprecated - kept for backward compatibility
+		artist := ParseStringPayload(payload)
+		log.Printf("BLE_LOG: Incremental artist update (deprecated): %s", artist)
+		bc.mu.Lock()
+		if bc.currentState == nil {
+			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
+		}
+		bc.currentState.Artist = &artist
+		bc.mu.Unlock()
+		bc.broadcastStateUpdate()
+		
+	case MsgStateAlbum:
+		// Deprecated - kept for backward compatibility
+		album := ParseStringPayload(payload)
+		log.Printf("BLE_LOG: Incremental album update (deprecated): %s", album)
+		bc.mu.Lock()
+		if bc.currentState == nil {
+			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
+		}
+		bc.currentState.Album = &album
+		bc.mu.Unlock()
+		bc.broadcastStateUpdate()
+		
+	case MsgStateArtistAlbum:
+		// Combined artist+album update
+		artist, album, err := ParseArtistAlbumPayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse artist+album: %v", err)
+			return
+		}
+		log.Printf("BLE_LOG: Incremental artist+album update: %s / %s", artist, album)
+		bc.mu.Lock()
+		if bc.currentState == nil {
+			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
+		}
+		bc.currentState.Artist = &artist
+		bc.currentState.Album = &album
+		bc.mu.Unlock()
+		bc.broadcastStateUpdate()
+		
+	case MsgStateTrack:
+		track := ParseStringPayload(payload)
+		log.Printf("BLE_LOG: Incremental track update: %s", track)
+		bc.mu.Lock()
+		if bc.currentState == nil {
+			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
+		}
+		bc.currentState.Track = &track
+		bc.mu.Unlock()
+		bc.broadcastStateUpdate()
+		
+	case MsgStatePosition:
+		position, err := ParseLongPayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse position: %v", err)
+			return
+		}
+		log.Printf("BLE_LOG: Incremental position update: %dms", position)
+		bc.mu.Lock()
+		if bc.currentState == nil {
+			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
+		}
+		bc.currentState.PositionMs = position
+		bc.mu.Unlock()
+		bc.broadcastStateUpdate()
+		
+	case MsgStateDuration:
+		duration, err := ParseLongPayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse duration: %v", err)
+			return
+		}
+		log.Printf("BLE_LOG: Incremental duration update: %dms", duration)
+		bc.mu.Lock()
+		if bc.currentState == nil {
+			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
+		}
+		bc.currentState.DurationMs = duration
+		bc.mu.Unlock()
+		bc.broadcastStateUpdate()
+		
+	case MsgStatePlayState:
+		isPlaying, err := ParseBooleanPayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse play state: %v", err)
+			return
+		}
+		log.Printf("BLE_LOG: Incremental play state update: %v", isPlaying)
+		bc.mu.Lock()
+		if bc.currentState == nil {
+			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
+		}
+		bc.currentState.IsPlaying = isPlaying
+		bc.mu.Unlock()
+		bc.broadcastStateUpdate()
+		
+	case MsgStateVolume:
+		volume, err := ParseBytePayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse volume: %v", err)
+			return
+		}
+		log.Printf("BLE_LOG: Incremental volume update: %d%%", volume)
+		bc.mu.Lock()
+		if bc.currentState == nil {
+			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
+		}
+		bc.currentState.VolumePercent = int(volume)
+		bc.mu.Unlock()
+		bc.broadcastStateUpdate()
+		
+	case MsgStateFull:
+		// Full state update in binary format (not implemented yet, fall back to JSON)
+		log.Printf("BLE_LOG: Full binary state update not yet implemented")
+		
 	default:
 		log.Printf("BLE_LOG: Unknown binary message type: 0x%04x", header.MessageType)
 	}
 }
 
+// broadcastStateUpdate sends the current state to WebSocket clients
+func (bc *BleClient) broadcastStateUpdate() {
+	bc.mu.RLock()
+	state := bc.currentState
+	bc.mu.RUnlock()
+	
+	if state != nil && bc.wsHub != nil {
+		bc.wsHub.Broadcast(utils.WebSocketEvent{
+			Type:    "media/state_update",
+			Payload: state,
+		})
+	}
+}
+
 // enableBinaryProtocol sends command to enable binary protocol
 func (bc *BleClient) enableBinaryProtocol() error {
+	// First enable binary incremental updates
 	cmd := map[string]interface{}{
-		"command": "enable_binary_protocol",
-		"command_id": fmt.Sprintf("binary_%d", time.Now().Unix()),
+		"command": "enable_binary_incremental",
+		"command_id": fmt.Sprintf("binary_incr_%d", time.Now().Unix()),
 	}
 	
 	cmdJson, err := json.Marshal(cmd)
