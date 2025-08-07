@@ -340,14 +340,30 @@ func main() {
 
 	wsHub := utils.NewWebSocketHub()
 
-	btManager, err := bluetooth.NewBluetoothManager(wsHub)
-	if err != nil {
-		log.Fatal("Failed to initialize bluetooth manager:", err)
+	// Retry bluetooth manager initialization with backoff
+	var btManager *bluetooth.BluetoothManager
+	var err error
+	for retries := 0; retries < 10; retries++ {
+		btManager, err = bluetooth.NewBluetoothManager(wsHub)
+		if err == nil {
+			break
+		}
+		log.Printf("Failed to initialize bluetooth manager (attempt %d/10): %v", retries+1, err)
+		if retries < 9 {
+			time.Sleep(time.Duration(retries+1) * time.Second)
+		}
+	}
+	
+	if btManager == nil {
+		log.Printf("ERROR: Could not initialize bluetooth manager after 10 attempts - continuing without BLE")
+		// Continue running without bluetooth rather than crashing
 	}
 	
 	// Set the album art callback to store in memory immediately
-	if bleClient := btManager.GetBleClient(); bleClient != nil {
-		bleClient.SetAlbumArtCallback(SetCurrentAlbumArt)
+	if btManager != nil {
+		if bleClient := btManager.GetBleClient(); bleClient != nil {
+			bleClient.SetAlbumArtCallback(SetCurrentAlbumArt)
+		}
 	}
 
 	if err := utils.InitBrightness(); err != nil {
@@ -2020,9 +2036,33 @@ func main() {
 	// Simple signal protection - ignore signals that might interfere with SPP
 	signal.Ignore(syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGHUP, syscall.SIGPIPE)
 
-	log.Printf("Server starting on :%s", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatal(err)
+	// Start HTTP server in a goroutine with error recovery
+	go func() {
+		for {
+			log.Printf("Server starting on :%s", port)
+			err := http.ListenAndServe(":"+port, nil)
+			if err != nil {
+				log.Printf("HTTP server error: %v - will retry in 5 seconds", err)
+				time.Sleep(5 * time.Second)
+			}
+		}
+	}()
+
+	// Keep main thread alive - only exit on explicit kill signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
+	
+	for {
+		sig := <-sigChan
+		log.Printf("Received signal: %v", sig)
+		
+		// Only exit on explicit termination signals
+		if sig == syscall.SIGINT || sig == syscall.SIGTERM || sig == syscall.SIGKILL {
+			log.Println("Shutting down nocturned...")
+			break
+		}
+		// Ignore other signals
+		log.Printf("Ignoring signal: %v", sig)
 	}
 }
 

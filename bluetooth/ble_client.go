@@ -3,6 +3,7 @@ package bluetooth
 import (
 	//"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	//"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -40,6 +41,16 @@ type BleClient struct {
 	reconnectAttempts int
 	currentState      *utils.MediaStateUpdate
 	stopChan          chan struct{}
+	
+	// Current track metadata - accessible from all functions
+	currentArtist    string
+	currentAlbum     string
+	currentTrack     string
+	
+	// Track change detection
+	previousTrackIdentifier string
+	hasNewTimestamp         bool
+	pendingTimestamp        int64
 
 	// BLE specific fields using D-Bus (matching existing codebase pattern)
 	conn              *dbus.Conn
@@ -88,6 +99,12 @@ type BleClient struct {
 	
 	// Album art callback
 	albumArtCallback func([]byte)
+	
+	// Album art request tracking
+	pendingAlbumArtRequest  bool
+	pendingAlbumArtHash     string
+	albumArtRequestMutex    sync.Mutex
+	lastAlbumArtRequestTime time.Time
 	
 	// Test mode album art management (separate from production)
 	testAlbumArtBuffer    []byte
@@ -810,6 +827,14 @@ func (bc *BleClient) negotiateMTU() error {
 }
 
 func (bc *BleClient) handleBleNotifications() {
+	// Add panic recovery for this critical goroutine
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("BLE_LOG: PANIC in handleBleNotifications: %v - attempting to reconnect", r)
+			bc.handleConnectionLoss()
+		}
+	}()
+	
 	log.Println("BLE_LOG: handleBleNotifications goroutine started")
 
 	// Start monitoring notifications
@@ -856,6 +881,16 @@ func (bc *BleClient) handleBleNotifications() {
 }
 
 func (bc *BleClient) monitorCharacteristicNotifications() {
+	// Add panic recovery for notification monitoring
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("BLE_LOG: PANIC in monitorCharacteristicNotifications: %v - restarting monitor", r)
+			// Restart the monitor after a delay
+			time.Sleep(1 * time.Second)
+			go bc.monitorCharacteristicNotifications()
+		}
+	}()
+	
 	log.Printf("BLE_LOG: Setting up D-Bus signal monitoring for notifications")
 	
 	// Add rate limiting to prevent notification floods
@@ -1042,7 +1077,12 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 	}
 
 	// Check if this is binary protocol data (album art or response characteristic)
-	if (charType == "albumart" || charType == "response") && len(data) >= BinaryHeaderSize {
+	// Only attempt binary parsing if binary protocol is enabled
+	bc.mu.RLock()
+	binaryEnabled := bc.supportsBinaryProtocol
+	bc.mu.RUnlock()
+	
+	if binaryEnabled && (charType == "albumart" || charType == "response") && len(data) >= BinaryHeaderSize {
 		// Try to parse as binary protocol
 		header, payload, err := ParseBinaryMessage(data)
 		if err == nil {
@@ -1050,6 +1090,7 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 			return
 		}
 		// Fall through to JSON parsing if binary parse fails
+		log.Printf("BLE_LOG: Binary parse failed, falling back to JSON: %v", err)
 	}
 	
 	// Handle as JSON
@@ -1099,17 +1140,43 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 			IncrementalUpdates    bool     `json:"incremental_updates"`
 		}
 		if err := json.Unmarshal(data, &caps); err == nil {
-			log.Printf("BLE Capabilities: Version %s, MTU %d, Features: %v, Binary Protocol: %v", 
-				caps.Version, caps.MTU, caps.Features, caps.BinaryProtocol)
+			log.Printf("BLE Capabilities: Version %s, MTU %d, Features: %v, Binary Protocol: %v, Incremental: %v", 
+				caps.Version, caps.MTU, caps.Features, caps.BinaryProtocol, caps.IncrementalUpdates)
 			
 			// Check if incremental updates are supported
 			if caps.IncrementalUpdates {
-				log.Printf("BLE_LOG: Device supports incremental updates, enabling...")
-				// Enable binary incremental updates
+				log.Printf("BLE_LOG: Device supports incremental updates, will enable binary protocol...")
+				// Enable binary incremental updates with retry
 				go func() {
 					time.Sleep(100 * time.Millisecond) // Small delay to ensure connection is stable
-					if err := bc.enableBinaryProtocol(); err != nil {
-						log.Printf("BLE_LOG: Failed to enable binary incremental updates: %v", err)
+					
+					// Try up to 3 times to enable binary protocol
+					for attempt := 1; attempt <= 3; attempt++ {
+						log.Printf("BLE_LOG: Enabling binary protocol (attempt %d/3)...", attempt)
+						if err := bc.enableBinaryProtocol(); err != nil {
+							log.Printf("BLE_LOG: Failed to enable binary protocol (attempt %d): %v", attempt, err)
+							if attempt < 3 {
+								time.Sleep(time.Duration(attempt) * time.Second) // Exponential backoff
+							}
+						} else {
+							log.Printf("BLE_LOG: Binary protocol enable command sent successfully")
+							
+							// Wait up to 3 seconds for confirmation
+							go func() {
+								time.Sleep(3 * time.Second)
+								bc.mu.RLock()
+								enabled := bc.supportsBinaryProtocol
+								bc.mu.RUnlock()
+								
+								if !enabled {
+									log.Printf("BLE_LOG: WARNING - Binary protocol not confirmed after 3 seconds")
+									log.Printf("BLE_LOG: Connection will continue in JSON mode")
+								} else {
+									log.Printf("BLE_LOG: Binary protocol verified as ACTIVE")
+								}
+							}()
+							break
+						}
 					}
 				}()
 			} else if caps.BinaryProtocol && caps.BinaryProtocolVersion >= 1 {
@@ -1136,6 +1203,23 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 			}
 		}
 		
+	case "timestampResponse":
+		// Timestamp response from request_timestamp command
+		var timestampResp struct {
+			Type       string `json:"type"`
+			PositionMs int64  `json:"position_ms"`
+		}
+		if err := json.Unmarshal(data, &timestampResp); err == nil {
+			log.Printf("BLE_LOG: Received timestamp response: %dms", timestampResp.PositionMs)
+			bc.mu.Lock()
+			bc.pendingTimestamp = timestampResp.PositionMs
+			bc.hasNewTimestamp = true
+			bc.mu.Unlock()
+			
+			// Broadcast the timestamp sync event
+			bc.broadcastStateUpdate()
+		}
+		
 	case "stateUpdate":
 		// Media state update
 		var stateUpdate utils.MediaStateUpdate
@@ -1146,9 +1230,9 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 		}
 
 		// Safe logging with nil checks
-		trackName := "<nil>"
-		artistName := "<nil>"
-		albumName := "<nil>"
+		trackName := ""
+		artistName := ""
+		albumName := ""
 		if stateUpdate.Track != nil {
 			trackName = *stateUpdate.Track
 		}
@@ -1163,12 +1247,20 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 
 		bc.mu.Lock()
 		bc.currentState = &stateUpdate
+		// Update the accessible track metadata fields
+		bc.currentTrack = trackName
+		bc.currentArtist = artistName
+		bc.currentAlbum = albumName
 		bc.mu.Unlock()
+		
+		// Check for track change and request timestamp if needed
+		if bc.checkTrackChange() {
+			go bc.SendTimestampRequest()
+		}
 
-		// Check for cached album art
-		if stateUpdate.Artist != nil && stateUpdate.Album != nil && 
-		   *stateUpdate.Artist != "" && *stateUpdate.Album != "" {
-			go bc.checkAndRequestAlbumArt(*stateUpdate.Artist, *stateUpdate.Album)
+		// Only request album art if we have valid metadata
+		if bc.currentArtist != "" && bc.currentAlbum != "" {
+			go bc.checkAndRequestAlbumArt(bc.currentArtist, bc.currentAlbum)
 		}
 
 		// Broadcast to WebSocket clients
@@ -1239,11 +1331,29 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 			Version int    `json:"version"`
 		}
 		if err := json.Unmarshal(data, &ack); err == nil {
-			log.Printf("BLE_LOG: Binary protocol enabled successfully, version %d", ack.Version)
+			log.Printf("BLE_LOG: ✓ Binary protocol CONFIRMED enabled, version %d", ack.Version)
 			bc.mu.Lock()
+			previousState := bc.supportsBinaryProtocol
 			bc.supportsBinaryProtocol = true
 			bc.binaryProtocolVersion = byte(ack.Version)
 			bc.mu.Unlock()
+			
+			if !previousState {
+				log.Printf("BLE_LOG: Binary protocol state changed from disabled to ENABLED")
+			}
+			
+			// Broadcast binary protocol status
+			if bc.wsHub != nil {
+				bc.wsHub.Broadcast(utils.WebSocketEvent{
+					Type: "media/binary_protocol_status",
+					Payload: map[string]interface{}{
+						"enabled": true,
+						"version": ack.Version,
+					},
+				})
+			}
+		} else {
+			log.Printf("BLE_LOG: Failed to parse binary_protocol_enabled acknowledgment: %v", err)
 		}
 		
 	case "album_art_start":
@@ -1707,6 +1817,12 @@ func (bc *BleClient) SendAlbumArtRequest(trackID string, checksum string) error 
 
 // checkAndRequestAlbumArt checks if album art is cached and requests it if not
 func (bc *BleClient) checkAndRequestAlbumArt(artist, album string) {
+	// Validate input
+	if artist == "" || album == "" || artist == "<nil>" || album == "<nil>" {
+		log.Printf("BLE_LOG: Skipping album art request for invalid metadata: artist=%s, album=%s", artist, album)
+		return
+	}
+	
 	// Check if album art is already cached
 	if utils.CheckAlbumArtExists(artist, album) {
 		log.Printf("BLE_LOG: Album art already cached for %s - %s", artist, album)
@@ -1748,15 +1864,96 @@ func (bc *BleClient) checkAndRequestAlbumArt(artist, album string) {
 	
 	// Generate hash for this artist/album combination
 	hash := utils.GenerateAlbumArtHash(artist, album)
+	
+	// Check if we already have a pending request
+	bc.albumArtRequestMutex.Lock()
+	defer bc.albumArtRequestMutex.Unlock()
+	
+	// If we have a pending request for the same hash, skip
+	if bc.pendingAlbumArtRequest && bc.pendingAlbumArtHash == hash {
+		log.Printf("BLE_LOG: Album art request already pending for hash: %s", hash)
+		return
+	}
+	
+	// If we have a pending request for a different hash, check timing
+	if bc.pendingAlbumArtRequest && bc.pendingAlbumArtHash != hash {
+		timeSinceLastRequest := time.Since(bc.lastAlbumArtRequestTime)
+		if timeSinceLastRequest < 200*time.Millisecond {
+			log.Printf("BLE_LOG: Deferring album art request for %s - %s, another request in progress", artist, album)
+			// Schedule a retry after the current request completes
+			go func() {
+				time.Sleep(300 * time.Millisecond)
+				bc.checkAndRequestAlbumArt(artist, album)
+			}()
+			return
+		}
+		// If request is old, assume it failed and proceed
+		if timeSinceLastRequest > 2*time.Second {
+			log.Printf("BLE_LOG: Previous album art request timed out, proceeding with new request")
+			bc.pendingAlbumArtRequest = false
+		}
+	}
+	
 	log.Printf("BLE_LOG: Album art not cached for %s - %s (hash: %s), requesting from companion", artist, album, hash)
+	
+	// Mark request as pending
+	bc.pendingAlbumArtRequest = true
+	bc.pendingAlbumArtHash = hash
+	bc.lastAlbumArtRequestTime = time.Now()
 	
 	// Create a track ID from artist and album
 	trackID := fmt.Sprintf("%s - %s", artist, album)
 	
 	// Request album art from companion app
-	if err := bc.SendAlbumArtRequest(trackID, hash); err != nil {
-		log.Printf("BLE_LOG: Failed to request album art: %v", err)
-	}
+	go func() {
+		// Add panic recovery
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("BLE_LOG: PANIC in album art request goroutine: %v", r)
+				// Clear pending status on panic
+				bc.albumArtRequestMutex.Lock()
+				if bc.pendingAlbumArtHash == hash {
+					bc.pendingAlbumArtRequest = false
+				}
+				bc.albumArtRequestMutex.Unlock()
+			}
+		}()
+		
+		if err := bc.SendAlbumArtRequest(trackID, hash); err != nil {
+			log.Printf("BLE_LOG: Failed to request album art: %v", err)
+			
+			// Clear pending status on error
+			bc.albumArtRequestMutex.Lock()
+			if bc.pendingAlbumArtHash == hash {
+				bc.pendingAlbumArtRequest = false
+			}
+			bc.albumArtRequestMutex.Unlock()
+			
+			// Retry if it was an "In Progress" error
+			if strings.Contains(err.Error(), "In Progress") {
+				log.Printf("BLE_LOG: Retrying album art request after In Progress error")
+				time.Sleep(500 * time.Millisecond)
+				bc.checkAndRequestAlbumArt(artist, album)
+			}
+		} else {
+			// Clear pending status after successful send (will be cleared when response arrives)
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("BLE_LOG: PANIC in album art timeout goroutine: %v", r)
+					}
+				}()
+				
+				time.Sleep(2 * time.Second) // Timeout for response
+				bc.albumArtRequestMutex.Lock()
+				if bc.pendingAlbumArtHash == hash {
+					bc.pendingAlbumArtRequest = false
+					log.Printf("BLE_LOG: Cleared pending album art request after timeout")
+				}
+				bc.albumArtRequestMutex.Unlock()
+			}()
+		}
+	}()
 }
 
 func (bc *BleClient) GetCurrentState() *utils.MediaStateUpdate {
@@ -1913,6 +2110,12 @@ func (bc *BleClient) processAlbumArt() {
 	bc.albumArtChunks = nil
 	bc.albumArtMutex.Unlock()
 	
+	// Clear pending album art request flag
+	bc.albumArtRequestMutex.Lock()
+	bc.pendingAlbumArtRequest = false
+	log.Printf("BLE_LOG: Cleared pending album art request flag after successful transfer")
+	bc.albumArtRequestMutex.Unlock()
+	
 	// Save to disk in background
 	go func() {
 		// Skip temp file save - we're serving from memory now
@@ -1993,6 +2196,11 @@ func (bc *BleClient) handleConnectionLoss() {
 	log.Printf("BLE connection lost to NocturneCompanion, cleaning up...")
 	bc.bleConnected = false
 	bc.connected = false
+	
+	// Reset binary protocol state - will be re-enabled after reconnection
+	bc.supportsBinaryProtocol = false
+	bc.binaryProtocolVersion = 0
+	log.Println("BLE_LOG: Reset binary protocol state for clean reconnection")
 
 	// Clean up BLE resources
 	if bc.devicePath != "" {
@@ -2048,6 +2256,163 @@ func (bc *BleClient) attemptReconnect() {
 // handleBinaryMessage processes binary protocol messages
 func (bc *BleClient) handleBinaryMessage(header *BinaryHeader, payload []byte) {
 	switch header.MessageType {
+	case MsgStateArtistAlbum:
+		// Handle combined artist+album incremental update
+		artist, album, err := ParseArtistAlbumPayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse artist+album payload: %v", err)
+			return
+		}
+		
+		log.Printf("BLE_LOG: Received incremental artist+album update: %s / %s", artist, album)
+		
+		// Update current state
+		bc.mu.Lock()
+		if bc.currentState == nil {
+			bc.currentState = &utils.MediaStateUpdate{}
+		}
+		bc.currentState.Artist = &artist
+		bc.currentState.Album = &album
+		// Update the accessible track metadata fields
+		bc.currentArtist = artist
+		bc.currentAlbum = album
+		hadTrack := bc.currentTrack != ""
+		bc.mu.Unlock()
+		
+		// Check for album art if we have complete metadata
+		// Request album art if:
+		// 1. We have artist and album
+		// 2. We already had a track (metadata is now complete)
+		if artist != "" && album != "" {
+			if hadTrack {
+				// We have complete metadata, request album art
+				log.Printf("BLE_LOG: Complete metadata available (track was already set), requesting album art")
+				go bc.checkAndRequestAlbumArt(artist, album)
+			}
+			// If no track yet, wait for track update to trigger the request
+		}
+		
+		// Broadcast the state update
+		bc.broadcastStateUpdate()
+		
+	case MsgStateTrack:
+		// Handle track title incremental update
+		track := string(payload)
+		log.Printf("BLE_LOG: Received incremental track update: %s", track)
+		
+		// Update current state
+		bc.mu.Lock()
+		if bc.currentState == nil {
+			bc.currentState = &utils.MediaStateUpdate{}
+		}
+		bc.currentState.Track = &track
+		// Update the accessible track metadata field
+		bc.currentTrack = track
+		currentArtist := bc.currentArtist
+		currentAlbum := bc.currentAlbum
+		bc.mu.Unlock()
+		
+		// Check for track change and request timestamp if needed
+		if bc.checkTrackChange() {
+			go bc.SendTimestampRequest()
+		}
+		
+		// Check for album art if we have complete metadata
+		if currentArtist != "" && currentAlbum != "" && track != "" {
+			// We have complete metadata, request album art
+			log.Printf("BLE_LOG: Complete metadata after track update, requesting album art for: %s - %s", currentArtist, currentAlbum)
+			go bc.checkAndRequestAlbumArt(currentArtist, currentAlbum)
+		} else if track != "" {
+			// We have track but missing artist/album
+			log.Printf("BLE_LOG: Track received but missing artist/album, deferring album art request")
+		}
+		
+		// Broadcast the state update
+		bc.broadcastStateUpdate()
+		
+	case MsgStatePosition:
+		// Handle position incremental update
+		if len(payload) >= 8 {
+			position := int64(binary.BigEndian.Uint64(payload))
+			log.Printf("BLE_LOG: Received incremental position update: %dms", position)
+			
+			bc.mu.Lock()
+			if bc.currentState == nil {
+				bc.currentState = &utils.MediaStateUpdate{}
+			}
+			bc.currentState.PositionMs = position
+			bc.mu.Unlock()
+			
+			// Broadcast the state update
+			bc.broadcastStateUpdate()
+		}
+		
+	case MsgStateDuration:
+		// Handle duration incremental update
+		if len(payload) >= 8 {
+			duration := int64(binary.BigEndian.Uint64(payload))
+			log.Printf("BLE_LOG: Received incremental duration update: %dms", duration)
+			
+			bc.mu.Lock()
+			if bc.currentState == nil {
+				bc.currentState = &utils.MediaStateUpdate{}
+			}
+			bc.currentState.DurationMs = duration
+			currentArtist := bc.currentArtist
+			currentAlbum := bc.currentAlbum
+			currentTrack := bc.currentTrack
+			bc.mu.Unlock()
+			
+			// Check for album art if we have complete metadata
+			// Duration often arrives last in the sequence
+			if currentArtist != "" && currentAlbum != "" && currentTrack != "" {
+				log.Printf("BLE_LOG: Complete metadata after duration update, requesting album art")
+				go bc.checkAndRequestAlbumArt(currentArtist, currentAlbum)
+			}
+			
+			// Broadcast the state update
+			bc.broadcastStateUpdate()
+		}
+		
+	case MsgStatePlayState:
+		// Handle play state incremental update
+		if len(payload) >= 1 {
+			isPlaying := payload[0] != 0
+			log.Printf("BLE_LOG: Received incremental play state update: %v", isPlaying)
+			
+			bc.mu.Lock()
+			if bc.currentState == nil {
+				bc.currentState = &utils.MediaStateUpdate{}
+			}
+			bc.currentState.IsPlaying = isPlaying
+			bc.mu.Unlock()
+			
+			// Broadcast the state update
+			bc.broadcastStateUpdate()
+		}
+		
+	case MsgStateVolume:
+		// Handle volume incremental update
+		if len(payload) >= 1 {
+			volume := int(payload[0])
+			log.Printf("BLE_LOG: Received incremental volume update: %d%%", volume)
+			
+			bc.mu.Lock()
+			if bc.currentState == nil {
+				bc.currentState = &utils.MediaStateUpdate{}
+			}
+			bc.currentState.VolumePercent = volume
+			bc.mu.Unlock()
+			
+			// Broadcast the state update
+			bc.broadcastStateUpdate()
+		}
+		
+	case MsgStateFull:
+		// Handle full state update in binary format
+		// This would need a more complex parsing based on the agreed format
+		log.Printf("BLE_LOG: Received binary full state update (not yet implemented)")
+		
 	case MsgAlbumArtStart:
 		startPayload, err := UnmarshalAlbumArtStartPayload(payload)
 		if err != nil {
@@ -2183,6 +2548,7 @@ func (bc *BleClient) handleBinaryMessage(header *BinaryHeader, payload []byte) {
 			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
 		}
 		bc.currentState.Artist = &artist
+		bc.currentArtist = artist
 		bc.mu.Unlock()
 		bc.broadcastStateUpdate()
 		
@@ -2195,100 +2561,9 @@ func (bc *BleClient) handleBinaryMessage(header *BinaryHeader, payload []byte) {
 			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
 		}
 		bc.currentState.Album = &album
+		bc.currentAlbum = album
 		bc.mu.Unlock()
 		bc.broadcastStateUpdate()
-		
-	case MsgStateArtistAlbum:
-		// Combined artist+album update
-		artist, album, err := ParseArtistAlbumPayload(payload)
-		if err != nil {
-			log.Printf("BLE_LOG: Failed to parse artist+album: %v", err)
-			return
-		}
-		log.Printf("BLE_LOG: Incremental artist+album update: %s / %s", artist, album)
-		bc.mu.Lock()
-		if bc.currentState == nil {
-			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
-		}
-		bc.currentState.Artist = &artist
-		bc.currentState.Album = &album
-		bc.mu.Unlock()
-		bc.broadcastStateUpdate()
-		
-	case MsgStateTrack:
-		track := ParseStringPayload(payload)
-		log.Printf("BLE_LOG: Incremental track update: %s", track)
-		bc.mu.Lock()
-		if bc.currentState == nil {
-			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
-		}
-		bc.currentState.Track = &track
-		bc.mu.Unlock()
-		bc.broadcastStateUpdate()
-		
-	case MsgStatePosition:
-		position, err := ParseLongPayload(payload)
-		if err != nil {
-			log.Printf("BLE_LOG: Failed to parse position: %v", err)
-			return
-		}
-		log.Printf("BLE_LOG: Incremental position update: %dms", position)
-		bc.mu.Lock()
-		if bc.currentState == nil {
-			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
-		}
-		bc.currentState.PositionMs = position
-		bc.mu.Unlock()
-		bc.broadcastStateUpdate()
-		
-	case MsgStateDuration:
-		duration, err := ParseLongPayload(payload)
-		if err != nil {
-			log.Printf("BLE_LOG: Failed to parse duration: %v", err)
-			return
-		}
-		log.Printf("BLE_LOG: Incremental duration update: %dms", duration)
-		bc.mu.Lock()
-		if bc.currentState == nil {
-			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
-		}
-		bc.currentState.DurationMs = duration
-		bc.mu.Unlock()
-		bc.broadcastStateUpdate()
-		
-	case MsgStatePlayState:
-		isPlaying, err := ParseBooleanPayload(payload)
-		if err != nil {
-			log.Printf("BLE_LOG: Failed to parse play state: %v", err)
-			return
-		}
-		log.Printf("BLE_LOG: Incremental play state update: %v", isPlaying)
-		bc.mu.Lock()
-		if bc.currentState == nil {
-			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
-		}
-		bc.currentState.IsPlaying = isPlaying
-		bc.mu.Unlock()
-		bc.broadcastStateUpdate()
-		
-	case MsgStateVolume:
-		volume, err := ParseBytePayload(payload)
-		if err != nil {
-			log.Printf("BLE_LOG: Failed to parse volume: %v", err)
-			return
-		}
-		log.Printf("BLE_LOG: Incremental volume update: %d%%", volume)
-		bc.mu.Lock()
-		if bc.currentState == nil {
-			bc.currentState = &utils.MediaStateUpdate{Type: "stateUpdate"}
-		}
-		bc.currentState.VolumePercent = int(volume)
-		bc.mu.Unlock()
-		bc.broadcastStateUpdate()
-		
-	case MsgStateFull:
-		// Full state update in binary format (not implemented yet, fall back to JSON)
-		log.Printf("BLE_LOG: Full binary state update not yet implemented")
 		
 	default:
 		log.Printf("BLE_LOG: Unknown binary message type: 0x%04x", header.MessageType)
@@ -2299,14 +2574,113 @@ func (bc *BleClient) handleBinaryMessage(header *BinaryHeader, payload []byte) {
 func (bc *BleClient) broadcastStateUpdate() {
 	bc.mu.RLock()
 	state := bc.currentState
+	hasNewTimestamp := bc.hasNewTimestamp
+	pendingTimestamp := bc.pendingTimestamp
 	bc.mu.RUnlock()
 	
 	if state != nil && bc.wsHub != nil {
+		// Send regular state update
 		bc.wsHub.Broadcast(utils.WebSocketEvent{
 			Type:    "media/state_update",
 			Payload: state,
 		})
+		
+		// If we have a new timestamp, send timestamp sync event
+		if hasNewTimestamp {
+			bc.wsHub.Broadcast(utils.WebSocketEvent{
+				Type: "media/timestamp_sync",
+				Payload: map[string]interface{}{
+					"position_ms": pendingTimestamp,
+					"new_timestamp_available": true,
+				},
+			})
+			
+			// Clear the flag after broadcasting
+			bc.mu.Lock()
+			bc.hasNewTimestamp = false
+			bc.mu.Unlock()
+		}
 	}
+}
+
+// checkTrackChange detects if track/artist/album has changed
+func (bc *BleClient) checkTrackChange() bool {
+	bc.mu.RLock()
+	state := bc.currentState
+	previousID := bc.previousTrackIdentifier
+	bc.mu.RUnlock()
+	
+	if state == nil {
+		return false
+	}
+	
+	// Build current track identifier
+	track := ""
+	artist := ""
+	album := ""
+	
+	if state.Track != nil {
+		track = *state.Track
+	}
+	if state.Artist != nil {
+		artist = *state.Artist
+	}
+	if state.Album != nil {
+		album = *state.Album
+	}
+	
+	currentID := fmt.Sprintf("%s|%s|%s", track, artist, album)
+	
+	// Check if changed
+	if currentID != previousID && previousID != "" {
+		bc.mu.Lock()
+		bc.previousTrackIdentifier = currentID
+		bc.mu.Unlock()
+		return true
+	}
+	
+	// Update stored identifier if first time
+	if previousID == "" {
+		bc.mu.Lock()
+		bc.previousTrackIdentifier = currentID
+		bc.mu.Unlock()
+	}
+	
+	return false
+}
+
+// GetCurrentTrackMetadata returns the current track, artist, and album
+func (bc *BleClient) GetCurrentTrackMetadata() (track, artist, album string) {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.currentTrack, bc.currentArtist, bc.currentAlbum
+}
+
+// GetCurrentTrack returns the current track name
+func (bc *BleClient) GetCurrentTrack() string {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.currentTrack
+}
+
+// GetCurrentArtist returns the current artist name
+func (bc *BleClient) GetCurrentArtist() string {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.currentArtist
+}
+
+// GetCurrentAlbum returns the current album name
+func (bc *BleClient) GetCurrentAlbum() string {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.currentAlbum
+}
+
+// SendTimestampRequest sends a request for current timestamp
+func (bc *BleClient) SendTimestampRequest() error {
+	log.Printf("BLE_LOG: Requesting timestamp due to track change")
+	return bc.SendCommand("request_timestamp", nil, nil)
 }
 
 // enableBinaryProtocol sends command to enable binary protocol
@@ -2322,7 +2696,7 @@ func (bc *BleClient) enableBinaryProtocol() error {
 		return fmt.Errorf("failed to marshal binary protocol command: %v", err)
 	}
 	
-	log.Printf("BLE_LOG: Enabling binary protocol support")
+	log.Printf("BLE_LOG: Sending enable_binary_incremental command...")
 	
 	charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
 	options := make(map[string]interface{})

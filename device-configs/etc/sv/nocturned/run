@@ -32,6 +32,9 @@ for i in 1 2 3 4 5; do
     sleep 2
 done
 
+# Create log directory if it doesn't exist
+mkdir -p /var/nocturne/logs
+
 # Start nocturned with output for debugging
-# Remove "> /dev/null 2>&1" to see logs in runsv
-exec /usr/local/bin/nocturned
+# Redirect to log file and let runsv capture it
+exec /usr/local/bin/nocturned 2>&1
