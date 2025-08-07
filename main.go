@@ -170,7 +170,7 @@ func GetCurrentAlbumArt() []byte {
 
 // waitForFilesystem waits for filesystem to be ready
 func waitForFilesystem() error {
-	maxRetries := 30
+	maxRetries := 5 // Reduced from 30 to 5 seconds
 	testFile := "/var/.nocturne_test"
 	
 	for i := 0; i < maxRetries; i++ {
@@ -178,7 +178,9 @@ func waitForFilesystem() error {
 		if err := os.WriteFile(testFile, []byte("test"), 0644); err == nil {
 			// Clean up test file
 			os.Remove(testFile)
-			log.Printf("Filesystem ready after %d seconds", i)
+			if i > 0 {
+				log.Printf("Filesystem ready after %d seconds", i)
+			}
 			return nil
 		}
 		
@@ -258,15 +260,17 @@ func optimizeBLEParameters() {
 func setupAlbumArtDirectory() error {
 	albumArtDir := "/var/nocturne/albumart"
 	
-	// Retry directory creation with exponential backoff
+	// Retry directory creation with minimal delay
 	var err error
-	for attempt := 0; attempt < 5; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		if err = os.MkdirAll(albumArtDir, 0755); err == nil {
 			break
 		}
 		
-		log.Printf("Failed to create album art directory (attempt %d/5): %v", attempt+1, err)
-		time.Sleep(time.Duration(1<<uint(attempt)) * time.Second) // Exponential backoff
+		log.Printf("Failed to create album art directory (attempt %d/3): %v", attempt+1, err)
+		if attempt < 2 {
+			time.Sleep(500 * time.Millisecond) // Quick retry
+		}
 	}
 	
 	if err != nil {
@@ -340,22 +344,22 @@ func main() {
 
 	wsHub := utils.NewWebSocketHub()
 
-	// Retry bluetooth manager initialization with backoff
+	// Retry bluetooth manager initialization with reduced delays
 	var btManager *bluetooth.BluetoothManager
 	var err error
-	for retries := 0; retries < 10; retries++ {
+	for retries := 0; retries < 3; retries++ {
 		btManager, err = bluetooth.NewBluetoothManager(wsHub)
 		if err == nil {
 			break
 		}
-		log.Printf("Failed to initialize bluetooth manager (attempt %d/10): %v", retries+1, err)
-		if retries < 9 {
-			time.Sleep(time.Duration(retries+1) * time.Second)
+		log.Printf("Failed to initialize bluetooth manager (attempt %d/3): %v", retries+1, err)
+		if retries < 2 {
+			time.Sleep(1 * time.Second) // Fixed 1 second delay
 		}
 	}
 	
 	if btManager == nil {
-		log.Printf("ERROR: Could not initialize bluetooth manager after 10 attempts - continuing without BLE")
+		log.Printf("ERROR: Could not initialize bluetooth manager after 3 attempts - continuing without BLE")
 		// Continue running without bluetooth rather than crashing
 	}
 	
