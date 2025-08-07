@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	//"encoding/hex"
-	"encoding/json"
+	"encoding/json" // Still needed for legacy fallback
 	"fmt"
 	"log"
 	"os"
@@ -482,6 +482,11 @@ func (bc *BleClient) connectBLE() error {
 
 	// Re-initialize stopChan for new connection
 	bc.stopChan = make(chan struct{})
+	
+	// Reset connection state for clean start
+	bc.capsReceived = false
+	bc.fullyConnected = false
+	bc.supportsBinaryProtocol = false
 
 	// Set device path
 	bc.devicePath = formatDevicePath(bc.btManager.adapter, bc.targetAddress)
@@ -521,9 +526,13 @@ func (bc *BleClient) connectBLE() error {
 			time.Sleep(1 * time.Second)
 			
 			// Check connection status again
-			if err := obj.Call("org.freedesktop.DBus.Properties.Get", 0, BLUEZ_DEVICE_INTERFACE, "Connected").Store(&connected); err == nil && connected {
-				log.Println("BLE_LOG: Device connected successfully")
-				break
+			var connVariant dbus.Variant
+			if err := obj.Call("org.freedesktop.DBus.Properties.Get", 0, BLUEZ_DEVICE_INTERFACE, "Connected").Store(&connVariant); err == nil {
+				if connVal, ok := connVariant.Value().(bool); ok && connVal {
+					connected = true
+					log.Println("BLE_LOG: Device connected successfully")
+					break
+				}
 			}
 			
 			if i == maxAttempts-1 {
@@ -588,9 +597,13 @@ func (bc *BleClient) discoverGattService() error {
 	var servicesResolved bool
 	maxRetries := 5
 	for i := 0; i < maxRetries; i++ {
-		if err := deviceObj.Call("org.freedesktop.DBus.Properties.Get", 0, BLUEZ_DEVICE_INTERFACE, "ServicesResolved").Store(&servicesResolved); err == nil && servicesResolved {
-			log.Println("BLE_LOG: Services resolved")
-			break
+		var srvVariant dbus.Variant
+		if err := deviceObj.Call("org.freedesktop.DBus.Properties.Get", 0, BLUEZ_DEVICE_INTERFACE, "ServicesResolved").Store(&srvVariant); err == nil {
+			if srvVal, ok := srvVariant.Value().(bool); ok && srvVal {
+				servicesResolved = true
+				log.Println("BLE_LOG: Services resolved")
+				break
+			}
 		}
 		
 		if i < maxRetries-1 {
@@ -784,31 +797,55 @@ func (bc *BleClient) setupCharacteristics() error {
 	}
 	*/
 	
-	// Request capabilities to check for binary protocol support
-	log.Println("BLE_LOG: Requesting device capabilities...")
+	// Request capabilities immediately - Android sends time sync after notifications are enabled
+	log.Println("BLE_LOG: Requesting device capabilities immediately...")
 	go func() {
-		// Small delay to ensure notifications are ready
-		time.Sleep(500 * time.Millisecond)
+		// No delay - send immediately to be ready for Android's initial messages
+		// Android sends time sync + state 50ms after notifications are enabled
 		
-		cmd := map[string]interface{}{
-			"command": "get_capabilities",
-			"command_id": fmt.Sprintf("cap_%d", time.Now().Unix()),
-		}
-		
-		cmdJson, err := json.Marshal(cmd)
-		if err != nil {
-			log.Printf("BLE_LOG: Failed to marshal capabilities request: %v", err)
-			return
-		}
+		// Create binary message for get capabilities
+		messageID := uint16(time.Now().Unix() & 0xFFFF)
+		cmdData := CreateMessage(MsgGetCapabilities, []byte{}, messageID)
 		
 		charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
 		options := make(map[string]interface{})
 		
-		if err := charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err; err != nil {
+		if err := charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdData, options).Err; err != nil {
 			log.Printf("BLE_LOG: Failed to request capabilities: %v", err)
+			
+			// Retry after a short delay if initial request fails
+			time.Sleep(100 * time.Millisecond)
+			if err := charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdData, options).Err; err != nil {
+				log.Printf("BLE_LOG: Retry failed for capabilities request: %v", err)
+			} else {
+				log.Printf("BLE_LOG: Capabilities request sent on retry (binary, ID: %d)", messageID)
+			}
 		} else {
-			log.Println("BLE_LOG: Capabilities request sent")
+			log.Printf("BLE_LOG: Capabilities request sent (binary, ID: %d)", messageID)
 		}
+		
+		// Set up retry timer for capabilities if not received
+		go func() {
+			time.Sleep(2 * time.Second)
+			bc.mu.RLock()
+			capsReceived := bc.capsReceived
+			bc.mu.RUnlock()
+			
+			if !capsReceived {
+				log.Println("BLE_LOG: Capabilities not received after 2s, retrying...")
+				messageID := uint16(time.Now().Unix() & 0xFFFF)
+				cmdData := CreateMessage(MsgGetCapabilities, []byte{}, messageID)
+				
+				charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
+				options := make(map[string]interface{})
+				
+				if err := charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdData, options).Err; err != nil {
+					log.Printf("BLE_LOG: Failed to retry capabilities request: %v", err)
+				} else {
+					log.Printf("BLE_LOG: Capabilities retry sent (binary, ID: %d)", messageID)
+				}
+			}
+		}()
 	}()
 
 	return nil
@@ -856,7 +893,8 @@ func (bc *BleClient) handleBleNotifications() {
 			if bc.devicePath != "" {
 				deviceObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.devicePath)
 				var connected bool
-				if err := deviceObj.Call("org.freedesktop.DBus.Properties.Get", 0, BLUEZ_DEVICE_INTERFACE, "Connected").Store(&connected); err != nil {
+				var variant dbus.Variant
+				if err := deviceObj.Call("org.freedesktop.DBus.Properties.Get", 0, BLUEZ_DEVICE_INTERFACE, "Connected").Store(&variant); err != nil {
 					connectionCheckFailures++
 					log.Printf("BLE_LOG: Error checking connection (failure %d/3): %v", connectionCheckFailures, err)
 					// Only handle connection loss after 3 consecutive failures
@@ -864,6 +902,14 @@ func (bc *BleClient) handleBleNotifications() {
 						bc.handleConnectionLoss()
 						return
 					}
+					continue
+				}
+				
+				// Extract boolean value from variant
+				if connectedVal, ok := variant.Value().(bool); ok {
+					connected = connectedVal
+				} else {
+					log.Printf("BLE_LOG: Warning - could not extract Connected value from variant")
 					continue
 				}
 				
@@ -969,6 +1015,24 @@ func (bc *BleClient) monitorCharacteristicNotifications() {
 							// sig.Body[1] is the changed properties (map[string]dbus.Variant)
 							if interfaceName, ok := sig.Body[0].(string); ok && interfaceName == BLUEZ_DEVICE_INTERFACE {
 								if changedProps, ok := sig.Body[1].(map[string]dbus.Variant); ok {
+									// Check for connection state changes
+									if connectedProp, exists := changedProps["Connected"]; exists {
+										if connectedVal, ok := connectedProp.Value().(bool); ok && !connectedVal {
+											log.Printf("BLE_LOG: Device disconnected signal received")
+											go bc.handleConnectionLoss()
+											continue
+										}
+									}
+									
+									// Check for ServicesResolved changes
+									if resolvedProp, exists := changedProps["ServicesResolved"]; exists {
+										if resolvedVal, ok := resolvedProp.Value().(bool); ok && !resolvedVal {
+											log.Printf("BLE_LOG: Services no longer resolved")
+											go bc.handleConnectionLoss()
+											continue
+										}
+									}
+									
 									if _, exists := changedProps["UUIDs"]; exists {
 										log.Printf("BLE_LOG: Device services changed (UUIDs property). This can disrupt the connection. Re-validating GATT profile.")
 										
@@ -1076,21 +1140,23 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 		return
 	}
 
-	// Check if this is binary protocol data (album art or response characteristic)
-	// Only attempt binary parsing if binary protocol is enabled
-	bc.mu.RLock()
-	binaryEnabled := bc.supportsBinaryProtocol
-	bc.mu.RUnlock()
-	
-	if binaryEnabled && (charType == "albumart" || charType == "response") && len(data) >= BinaryHeaderSize {
-		// Try to parse as binary protocol
-		header, payload, err := ParseBinaryMessage(data)
+	// Always try binary protocol first (v2 has version in header)
+	if len(data) >= BinaryHeaderSize {
+		// Try to parse as enhanced binary protocol
+		header, payload, err := ParseMessage(data)
 		if err == nil {
-			bc.handleBinaryMessage(header, payload)
+			log.Printf("BLE_LOG: Received binary message type: 0x%04X (%s), size: %d", 
+				header.MessageType, GetMessageTypeString(header.MessageType), header.PayloadSize)
+			bc.handleBinaryMessageV2(header, payload)
 			return
 		}
-		// Fall through to JSON parsing if binary parse fails
-		log.Printf("BLE_LOG: Binary parse failed, falling back to JSON: %v", err)
+		
+		// Try legacy binary protocol for album art
+		legacyHeader, legacyPayload, err := ParseBinaryMessage(data)
+		if err == nil {
+			bc.handleBinaryMessage(legacyHeader, legacyPayload)
+			return
+		}
 	}
 	
 	// Handle as JSON
@@ -1601,7 +1667,7 @@ func (bc *BleClient) processCommandQueue() {
 	}
 }
 
-// sendCommandImmediate actually sends a command and waits for ACK
+// sendCommandImmediate actually sends a command using binary protocol
 func (bc *BleClient) sendCommandImmediate(cmdItem *CommandQueueItem) error {
 	bc.commandQueueMu.Lock()
 	bc.activeCommand = cmdItem
@@ -1616,26 +1682,51 @@ func (bc *BleClient) sendCommandImmediate(cmdItem *CommandQueueItem) error {
 		time.Sleep(waitTime)
 	}
 	
-	cmd := utils.MediaCommand{
-		Command:      cmdItem.command,
-		ValueMs:      cmdItem.valueMs,
-		ValuePercent: cmdItem.valuePercent,
-		// No command ID needed without ACK system
+	// Map command string to binary message type
+	var msgType uint16
+	switch cmdItem.command {
+	case "play":
+		msgType = MsgCmdPlay
+	case "pause":
+		msgType = MsgCmdPause
+	case "next":
+		msgType = MsgCmdNext
+	case "previous":
+		msgType = MsgCmdPrevious
+	case "seek_to":
+		msgType = MsgCmdSeekTo
+	case "set_volume":
+		msgType = MsgCmdSetVolume
+	case "request_state":
+		msgType = MsgCmdRequestState
+	case "request_timestamp":
+		msgType = MsgCmdRequestTimestamp
+	case "album_art_query":
+		msgType = MsgCmdAlbumArtQuery
+	case "test_album_art_request":
+		msgType = MsgCmdTestAlbumArt
+	default:
+		return fmt.Errorf("unknown command type: %s", cmdItem.command)
 	}
 	
-	// For album_art_query, add checksum to payload
-	if cmdItem.command == "album_art_query" {
-		cmd.Payload = map[string]string{
-			"checksum": cmdItem.hash,
-			"track_id": "test",
-		}
+	// Create command payload
+	var valueMs *int64
+	if cmdItem.valueMs != nil {
+		ms := int64(*cmdItem.valueMs)
+		valueMs = &ms
 	}
-
-	// Convert command to JSON
-	cmdJson, err := json.Marshal(cmd)
-	if err != nil {
-		return fmt.Errorf("failed to marshal command: %v", err)
+	var payload []byte
+	
+	// Special handling for album art query
+	if cmdItem.command == "album_art_query" && cmdItem.hash != "" {
+		payload = CreateAlbumArtQueryPayload(cmdItem.hash)
+	} else {
+		payload = CreateCommandPayload(valueMs, cmdItem.valuePercent)
 	}
+	
+	// Create binary message
+	messageID := uint16(time.Now().Unix() & 0xFFFF)
+	cmdData := CreateMessage(msgType, payload, messageID)
 
 	// Check if command exceeds MTU
 	bc.mu.RLock()
@@ -1643,13 +1734,13 @@ func (bc *BleClient) sendCommandImmediate(cmdItem *CommandQueueItem) error {
 	bc.mu.RUnlock()
 	
 	effectiveMTU := int(currentMTU - MTUHeaderSize)
-	if len(cmdJson) > effectiveMTU {
-		log.Printf("BLE_LOG: WARNING - Command size %d exceeds MTU %d, may fail", len(cmdJson), effectiveMTU)
-		// For now, still try to send but log the warning
-		// In the future, implement command chunking or compression
+	if len(cmdData) > effectiveMTU {
+		log.Printf("BLE_LOG: WARNING - Command size %d exceeds MTU %d, may fail", len(cmdData), effectiveMTU)
+		// Binary protocol is more compact, but still check
 	}
 
-	log.Printf("BLE_LOG: Sending command: %s with ID: %s (size: %d bytes)", cmdItem.command, cmdItem.id, len(cmdJson))
+	log.Printf("BLE_LOG: Sending binary command: %s (0x%04X) with ID: %d (size: %d bytes)", 
+		cmdItem.command, msgType, messageID, len(cmdData))
 
 	// Send using D-Bus
 	charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
@@ -1658,13 +1749,14 @@ func (bc *BleClient) sendCommandImmediate(cmdItem *CommandQueueItem) error {
 	
 	// Try to send
 	maxRetries := 3
+	var err error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
 			log.Printf("BLE_LOG: Retry attempt %d for command %s", attempt, cmdItem.command)
 			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
 		}
 		
-		err = charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err
+		err = charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdData, options).Err
 		if err == nil {
 			bc.lastCommandTime = time.Now()
 			log.Printf("BLE_LOG: Command sent successfully via %s", bc.commandRxCharPath)
@@ -1792,28 +1884,19 @@ func (bc *BleClient) UpdateLocalVolume(volumePercent int) {
 	}
 }
 
-func (bc *BleClient) SendAlbumArtRequest(trackID string, checksum string) error {
-    payload := map[string]string{
-        "track_id": trackID,
-        "checksum": checksum,
-    }
-    // This is a special command that doesn't go through the normal queue
-    // because it's a request from nocturned to the companion app.
-    cmd := utils.MediaCommand{
-        Command: "album_art_query",
-        Payload: payload,
-    }
-    cmdJson, err := json.Marshal(cmd)
-    if err != nil {
-        return fmt.Errorf("failed to marshal album art request: %v", err)
-    }
-
-    log.Printf("BLE_LOG: Sending album art request for checksum: %s", checksum)
-    
-    charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
-    options := make(map[string]interface{})
-    return charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err
+// UpdateLocalPlayState updates the local play/pause state immediately
+func (bc *BleClient) UpdateLocalPlayState(isPlaying bool) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	
+	if bc.currentState != nil {
+		bc.currentState.IsPlaying = isPlaying
+		log.Printf("BLE_LOG: Updated local play state to %v", isPlaying)
+		// Broadcast the state change immediately
+		go bc.broadcastStateUpdate()
+	}
 }
+
 
 // checkAndRequestAlbumArt checks if album art is cached and requests it if not
 func (bc *BleClient) checkAndRequestAlbumArt(artist, album string) {
@@ -1901,9 +1984,6 @@ func (bc *BleClient) checkAndRequestAlbumArt(artist, album string) {
 	bc.pendingAlbumArtHash = hash
 	bc.lastAlbumArtRequestTime = time.Now()
 	
-	// Create a track ID from artist and album
-	trackID := fmt.Sprintf("%s - %s", artist, album)
-	
 	// Request album art from companion app
 	go func() {
 		// Add panic recovery
@@ -1919,7 +1999,7 @@ func (bc *BleClient) checkAndRequestAlbumArt(artist, album string) {
 			}
 		}()
 		
-		if err := bc.SendAlbumArtRequest(trackID, hash); err != nil {
+		if err := bc.SendCommandWithHash("album_art_query", nil, nil, hash); err != nil {
 			log.Printf("BLE_LOG: Failed to request album art: %v", err)
 			
 			// Clear pending status on error
@@ -1970,9 +2050,11 @@ func (bc *BleClient) IsConnected() bool {
 
 
 func (bc *BleClient) processAlbumArt() {
+	log.Printf("BLE_LOG: Processing album art...")
 	bc.albumArtMutex.Lock()
 	
 	if !bc.albumArtReceiving || bc.albumArtChunks == nil {
+		log.Printf("BLE_LOG: Cannot process - receiving=%v, chunks=%v", bc.albumArtReceiving, bc.albumArtChunks != nil)
 		bc.albumArtMutex.Unlock()
 		return
 	}
@@ -1987,11 +2069,8 @@ func (bc *BleClient) processAlbumArt() {
 		return
 	}
 	
-	// Pre-allocate buffer with exact size to avoid reallocations
-	bc.albumArtBuffer = make([]byte, bc.albumArtSize)
-	offset := 0
-	
-	// Assemble chunks directly into pre-allocated buffer
+	// Calculate actual size from chunks since bc.albumArtSize might be wrong
+	actualSize := 0
 	for i := 0; i < bc.albumArtTotalChunks; i++ {
 		chunk, exists := bc.albumArtChunks[i]
 		if !exists {
@@ -2001,6 +2080,19 @@ func (bc *BleClient) processAlbumArt() {
 			bc.albumArtMutex.Unlock()
 			return
 		}
+		actualSize += len(chunk)
+	}
+	
+	log.Printf("BLE_LOG: Assembling %d chunks into %d bytes (declared size: %d)", 
+		bc.albumArtTotalChunks, actualSize, bc.albumArtSize)
+	
+	// Pre-allocate buffer with actual size
+	bc.albumArtBuffer = make([]byte, actualSize)
+	offset := 0
+	
+	// Assemble chunks directly into pre-allocated buffer
+	for i := 0; i < bc.albumArtTotalChunks; i++ {
+		chunk := bc.albumArtChunks[i]
 		copy(bc.albumArtBuffer[offset:], chunk)
 		offset += len(chunk)
 	}
@@ -2200,7 +2292,9 @@ func (bc *BleClient) handleConnectionLoss() {
 	// Reset binary protocol state - will be re-enabled after reconnection
 	bc.supportsBinaryProtocol = false
 	bc.binaryProtocolVersion = 0
-	log.Println("BLE_LOG: Reset binary protocol state for clean reconnection")
+	bc.capsReceived = false
+	bc.fullyConnected = false
+	log.Println("BLE_LOG: Reset binary protocol and connection state for clean reconnection")
 
 	// Clean up BLE resources
 	if bc.devicePath != "" {
@@ -2250,6 +2344,267 @@ func (bc *BleClient) attemptReconnect() {
 	if err := bc.DiscoverAndConnect(); err != nil {
 		log.Printf("BLE media client reconnection failed: %v", err)
 		bc.attemptReconnect()
+	}
+}
+
+// handleBinaryMessageV2 processes enhanced binary protocol v2 messages
+func (bc *BleClient) handleBinaryMessageV2(header *MessageHeader, payload []byte) {
+	switch header.MessageType {
+	// System messages
+	case MsgCapabilities:
+		// Debug: Log the raw payload bytes
+		log.Printf("BLE_LOG: Capabilities payload bytes (%d): %x", len(payload), payload)
+		caps, err := ParseCapabilitiesPayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse capabilities: %v", err)
+			return
+		}
+		log.Printf("BLE Capabilities: Version %s, MTU %d, Features: %v, Debug: %v", 
+			caps.Version, caps.MTU, caps.Features, caps.DebugEnabled)
+		
+		bc.mu.Lock()
+		bc.mtu = uint16(caps.MTU)
+		bc.supportsBinaryProtocol = true
+		bc.binaryProtocolVersion = BinaryProtocolVersion
+		bc.fullyConnected = true
+		bc.capsReceived = true
+		bc.mu.Unlock()
+		
+		// Send initial state request
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			bc.SendCommand("request_state", nil, nil)
+		}()
+		
+	case MsgTimeSync:
+		sync, err := ParseTimeSyncPayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse time sync: %v", err)
+			return
+		}
+		log.Printf("BLE_LOG: Received time sync - Timestamp: %d, Timezone: %s", sync.TimestampMs, sync.Timezone)
+		
+		// Broadcast time sync event
+		if bc.wsHub != nil {
+			bc.wsHub.Broadcast(utils.WebSocketEvent{
+				Type: "time_sync",
+				Payload: map[string]interface{}{
+					"timestamp_ms": sync.TimestampMs,
+					"timezone":    sync.Timezone,
+				},
+			})
+		}
+		
+	// State messages
+	case MsgStateFull:
+		state, err := ParseFullStatePayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse full state: %v", err)
+			return
+		}
+		
+		bc.mu.Lock()
+		bc.currentArtist = state.Artist
+		bc.currentAlbum = state.Album
+		bc.currentTrack = state.Track
+		
+		stateUpdate := &utils.MediaStateUpdate{
+			Artist:       &state.Artist,
+			Album:        &state.Album,
+			Track:        &state.Track,
+			DurationMs:   state.DurationMs,
+			PositionMs:   state.PositionMs,
+			IsPlaying:    state.IsPlaying,
+			VolumePercent: state.VolumePercent,
+		}
+		bc.currentState = stateUpdate
+		bc.mu.Unlock()
+		
+		// Broadcast state update using the standard function
+		bc.broadcastStateUpdate()
+		
+		// Check for album art if we have complete metadata
+		if state.Artist != "" && state.Album != "" && state.Track != "" {
+			log.Printf("BLE_LOG: Complete metadata in full state, requesting album art for: %s - %s", state.Artist, state.Album)
+			go bc.checkAndRequestAlbumArt(state.Artist, state.Album)
+		}
+		
+	case MsgStateArtist:
+		artist := string(payload)
+		bc.mu.Lock()
+		bc.currentArtist = artist
+		if bc.currentState != nil {
+			bc.currentState.Artist = &artist
+		}
+		bc.mu.Unlock()
+		log.Printf("BLE_LOG: Artist update: %s", artist)
+		
+	case MsgStateAlbum:
+		album := string(payload)
+		bc.mu.Lock()
+		bc.currentAlbum = album
+		if bc.currentState != nil {
+			bc.currentState.Album = &album
+		}
+		bc.mu.Unlock()
+		log.Printf("BLE_LOG: Album update: %s", album)
+		
+	case MsgStateTrack:
+		track := string(payload)
+		bc.mu.Lock()
+		bc.currentTrack = track
+		if bc.currentState != nil {
+			bc.currentState.Track = &track
+		}
+		bc.mu.Unlock()
+		log.Printf("BLE_LOG: Track update: %s", track)
+		
+	case MsgStatePosition:
+		if len(payload) >= 8 {
+			position := int64(binary.BigEndian.Uint64(payload[:8]))
+			bc.mu.Lock()
+			if bc.currentState != nil {
+				bc.currentState.PositionMs = position
+			}
+			bc.mu.Unlock()
+			log.Printf("BLE_LOG: Position update: %dms", position)
+		}
+		
+	case MsgStateDuration:
+		if len(payload) >= 8 {
+			duration := int64(binary.BigEndian.Uint64(payload[:8]))
+			bc.mu.Lock()
+			if bc.currentState != nil {
+				bc.currentState.DurationMs = duration
+			}
+			bc.mu.Unlock()
+			log.Printf("BLE_LOG: Duration update: %dms", duration)
+		}
+		
+	case MsgStatePlayStatus:
+		if len(payload) >= 1 {
+			isPlaying := payload[0] != 0
+			bc.mu.Lock()
+			if bc.currentState != nil {
+				bc.currentState.IsPlaying = isPlaying
+			}
+			bc.mu.Unlock()
+			log.Printf("BLE_LOG: Play status update: %v", isPlaying)
+		}
+		
+	case MsgStateVolume:
+		if len(payload) >= 1 {
+			volume := int(payload[0])
+			bc.mu.Lock()
+			if bc.currentState != nil {
+				bc.currentState.VolumePercent = volume
+			}
+			bc.mu.Unlock()
+			log.Printf("BLE_LOG: Volume update: %d%%", volume)
+		}
+		
+	case MsgStateArtistAlbum:
+		artist, album, err := ParseArtistAlbumPayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse artist+album: %v", err)
+			return
+		}
+		bc.mu.Lock()
+		bc.currentArtist = artist
+		bc.currentAlbum = album
+		if bc.currentState != nil {
+			bc.currentState.Artist = &artist
+			bc.currentState.Album = &album
+		}
+		bc.mu.Unlock()
+		log.Printf("BLE_LOG: Artist+Album update: %s / %s", artist, album)
+		
+	// Album art messages
+	case MsgAlbumArtStart:
+		artStart, err := UnmarshalAlbumArtStartPayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse album art start: %v", err)
+			return
+		}
+		bc.albumArtMutex.Lock()
+		bc.albumArtReceiving = true
+		bc.albumArtTrackID = artStart.TrackID
+		bc.albumArtSize = int(artStart.ImageSize)
+		bc.albumArtChecksum = BytesToHex(artStart.Checksum[:])
+		bc.albumArtTotalChunks = int(artStart.TotalChunks)
+		bc.albumArtChunks = make(map[int][]byte)
+		bc.albumArtStartTime = time.Now()
+		bc.albumArtMutex.Unlock()
+		log.Printf("BLE_LOG: Album art transfer started - Track: %s, Size: %d, Chunks: %d", 
+			artStart.TrackID, artStart.ImageSize, artStart.TotalChunks)
+		
+	case MsgAlbumArtChunk:
+		// Like legacy protocol, chunk index is in header.MessageID
+		bc.albumArtMutex.Lock()
+		if bc.albumArtReceiving {
+			// Get chunk index from header
+			chunkIndex := int(header.MessageID)
+			
+			// Check for duplicate chunks
+			if _, exists := bc.albumArtChunks[chunkIndex]; exists {
+				log.Printf("BLE_LOG: Duplicate chunk %d received, ignoring", chunkIndex)
+				bc.albumArtMutex.Unlock()
+				return
+			}
+			
+			// Store chunk data (entire payload is image data)
+			bc.albumArtChunks[chunkIndex] = payload
+			receivedCount := len(bc.albumArtChunks)
+			log.Printf("BLE_LOG: Received album art chunk %d/%d (%d bytes) - Total received: %d",
+				chunkIndex+1, bc.albumArtTotalChunks, len(payload), receivedCount)
+		}
+		bc.albumArtMutex.Unlock()
+		
+	case MsgAlbumArtEnd:
+		artEnd, err := UnmarshalAlbumArtEndPayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse album art end: %v", err)
+			return
+		}
+		
+		bc.albumArtMutex.Lock()
+		if bc.albumArtReceiving && BytesToHex(artEnd.Checksum[:]) == bc.albumArtChecksum {
+			if artEnd.Success {
+				// Process the completed album art
+				bc.albumArtMutex.Unlock()
+				bc.processAlbumArt()
+				log.Printf("BLE_LOG: Album art transfer completed successfully")
+			} else {
+				log.Printf("BLE_LOG: Album art transfer failed")
+				bc.albumArtReceiving = false
+				bc.albumArtBuffer = nil
+				bc.albumArtChunks = nil
+				bc.albumArtMutex.Unlock()
+			}
+		} else {
+			bc.albumArtMutex.Unlock()
+			log.Printf("BLE_LOG: Album art end checksum mismatch or not receiving")
+		}
+		
+	// Error messages
+	case MsgError, MsgErrorCommandFailed:
+		errData, err := ParseErrorPayload(payload)
+		if err != nil {
+			log.Printf("BLE_LOG: Failed to parse error: %v", err)
+			return
+		}
+		log.Printf("BLE ERROR: %s - %s", errData.Code, errData.Message)
+		
+	case MsgEnableBinaryIncremental:
+		// Android app confirms binary incremental mode is enabled
+		enabled := false
+		if len(payload) > 0 {
+			enabled = payload[0] == 1
+		}
+		log.Printf("BLE_LOG: Binary incremental updates %s", map[bool]string{true: "enabled", false: "disabled"}[enabled])
+		
+	default:
+		log.Printf("BLE_LOG: Unknown binary message type: 0x%04X", header.MessageType)
 	}
 }
 
@@ -2374,7 +2729,7 @@ func (bc *BleClient) handleBinaryMessage(header *BinaryHeader, payload []byte) {
 			bc.broadcastStateUpdate()
 		}
 		
-	case MsgStatePlayState:
+	case MsgStatePlayStatus:
 		// Handle play state incremental update
 		if len(payload) >= 1 {
 			isPlaying := payload[0] != 0
@@ -2408,10 +2763,84 @@ func (bc *BleClient) handleBinaryMessage(header *BinaryHeader, payload []byte) {
 			bc.broadcastStateUpdate()
 		}
 		
-	case MsgStateFull:
-		// Handle full state update in binary format
-		// This would need a more complex parsing based on the agreed format
-		log.Printf("BLE_LOG: Received binary full state update (not yet implemented)")
+	// Legacy album art messages (0x0100-0x0102)
+	case MsgLegacyAlbumArtStart:
+		log.Printf("BLE_LOG: Received legacy album art start message")
+		// The legacy protocol stores chunk index in the header, not payload
+		// Payload structure: [32 bytes SHA256][4 bytes total chunks][4 bytes image size][variable track ID]
+		if len(payload) < 40 {
+			log.Printf("BLE_LOG: Legacy album art start payload too small: %d bytes", len(payload))
+			return
+		}
+		
+		checksum := payload[0:32]
+		totalChunks := binary.BigEndian.Uint32(payload[32:36])
+		imageSize := binary.BigEndian.Uint32(payload[36:40])
+		trackID := string(payload[40:])
+		
+		bc.albumArtMutex.Lock()
+		bc.albumArtReceiving = true
+		bc.albumArtBuffer = nil
+		bc.albumArtChunks = make(map[int][]byte, int(totalChunks))
+		bc.albumArtTrackID = trackID
+		bc.albumArtSize = int(imageSize)
+		bc.albumArtChecksum = BytesToHex(checksum)
+		bc.albumArtTotalChunks = int(totalChunks)
+		bc.albumArtStartTime = time.Now()
+		bc.albumArtMutex.Unlock()
+		
+		log.Printf("BLE_LOG: Legacy album art transfer starting - Track: %s, Size: %d bytes, Chunks: %d",
+			trackID, imageSize, totalChunks)
+		
+	case MsgLegacyAlbumArtChunk:
+		bc.albumArtMutex.Lock()
+		if bc.albumArtReceiving {
+			// Legacy protocol uses header.ChunkIndex for the chunk index
+			chunkIndex := int(header.ChunkIndex)
+			
+			// Check for duplicate chunks
+			if _, exists := bc.albumArtChunks[chunkIndex]; exists {
+				log.Printf("BLE_LOG: Duplicate legacy chunk %d received, ignoring", chunkIndex)
+				bc.albumArtMutex.Unlock()
+				return
+			}
+			
+			// Store chunk data (entire payload is image data)
+			bc.albumArtChunks[chunkIndex] = payload
+			receivedCount := len(bc.albumArtChunks)
+			log.Printf("BLE_LOG: Received legacy album art chunk %d/%d (%d bytes) - Total received: %d", 
+				chunkIndex+1, bc.albumArtTotalChunks, len(payload), receivedCount)
+		}
+		bc.albumArtMutex.Unlock()
+		
+	case MsgLegacyAlbumArtEnd:
+		// Legacy end message payload: [32 bytes SHA256][1 byte success]
+		if len(payload) < 33 {
+			log.Printf("BLE_LOG: Legacy album art end payload too small: %d bytes", len(payload))
+			return
+		}
+		
+		checksum := BytesToHex(payload[0:32])
+		success := payload[32] != 0
+		
+		bc.albumArtMutex.Lock()
+		if bc.albumArtReceiving && checksum == bc.albumArtChecksum {
+			if success {
+				// Process the completed album art
+				bc.albumArtMutex.Unlock()
+				bc.processAlbumArt()
+				log.Printf("BLE_LOG: Legacy album art transfer completed successfully")
+			} else {
+				log.Printf("BLE_LOG: Legacy album art transfer failed")
+				bc.albumArtReceiving = false
+				bc.albumArtBuffer = nil
+				bc.albumArtChunks = nil
+				bc.albumArtMutex.Unlock()
+			}
+		} else {
+			bc.albumArtMutex.Unlock()
+			log.Printf("BLE_LOG: Legacy album art end checksum mismatch - expected: %s, got: %s", bc.albumArtChecksum, checksum)
+		}
 		
 	case MsgAlbumArtStart:
 		startPayload, err := UnmarshalAlbumArtStartPayload(payload)
@@ -2438,16 +2867,21 @@ func (bc *BleClient) handleBinaryMessage(header *BinaryHeader, payload []byte) {
 	case MsgAlbumArtChunk:
 		bc.albumArtMutex.Lock()
 		if bc.albumArtReceiving {
+			// Like legacy protocol, chunk index is in header.ChunkIndex
 			chunkIndex := int(header.ChunkIndex)
 			
 			// Check for duplicate chunks
 			if _, exists := bc.albumArtChunks[chunkIndex]; exists {
+				log.Printf("BLE_LOG: Duplicate chunk %d received, ignoring", chunkIndex)
 				bc.albumArtMutex.Unlock()
 				return
 			}
 			
-			// Store chunk (payload is raw image data, no decoding needed)
+			// Store chunk data (entire payload is image data)
 			bc.albumArtChunks[chunkIndex] = payload
+			receivedCount := len(bc.albumArtChunks)
+			log.Printf("BLE_LOG: Received album art chunk %d/%d (%d bytes) - Total received: %d", 
+				chunkIndex+1, bc.albumArtTotalChunks, len(payload), receivedCount)
 		}
 		bc.albumArtMutex.Unlock()
 		
@@ -2494,6 +2928,7 @@ func (bc *BleClient) handleBinaryMessage(header *BinaryHeader, payload []byte) {
 	case MsgTestAlbumArtChunk:
 		bc.testAlbumArtMutex.Lock()
 		if bc.testAlbumArtReceiving {
+			// Like legacy protocol, chunk index is in header.ChunkIndex
 			chunkIndex := int(header.ChunkIndex)
 			
 			// Check for duplicate chunks
@@ -2502,11 +2937,11 @@ func (bc *BleClient) handleBinaryMessage(header *BinaryHeader, payload []byte) {
 				return
 			}
 			
-			// Store chunk (payload is raw image data, no decoding needed)
+			// Store chunk data (entire payload is image data)
 			bc.testAlbumArtChunks[chunkIndex] = payload
 			bc.testAlbumArtMutex.Unlock()
 			
-			// Handle the chunk
+			// Handle the chunk with the actual data
 			bc.handleTestAlbumArtChunk(chunkIndex, payload)
 		} else {
 			bc.testAlbumArtMutex.Unlock()
@@ -2579,6 +3014,21 @@ func (bc *BleClient) broadcastStateUpdate() {
 	bc.mu.RUnlock()
 	
 	if state != nil && bc.wsHub != nil {
+		// Log what we're broadcasting
+		artist := ""
+		album := ""
+		track := ""
+		if state.Artist != nil {
+			artist = *state.Artist
+		}
+		if state.Album != nil {
+			album = *state.Album
+		}
+		if state.Track != nil {
+			track = *state.Track
+		}
+		log.Printf("BLE_LOG: Broadcasting state update - Artist: %s, Album: %s, Track: %s", artist, album, track)
+		
 		// Send regular state update
 		bc.wsHub.Broadcast(utils.WebSocketEvent{
 			Type:    "media/state_update",
@@ -2685,29 +3135,22 @@ func (bc *BleClient) SendTimestampRequest() error {
 
 // enableBinaryProtocol sends command to enable binary protocol
 func (bc *BleClient) enableBinaryProtocol() error {
-	// First enable binary incremental updates
-	cmd := map[string]interface{}{
-		"command": "enable_binary_incremental",
-		"command_id": fmt.Sprintf("binary_incr_%d", time.Now().Unix()),
-	}
+	// Create binary message for enable binary incremental
+	messageID := uint16(time.Now().Unix() & 0xFFFF)
+	cmdData := CreateMessage(MsgEnableBinaryIncremental, []byte{}, messageID)
 	
-	cmdJson, err := json.Marshal(cmd)
-	if err != nil {
-		return fmt.Errorf("failed to marshal binary protocol command: %v", err)
-	}
-	
-	log.Printf("BLE_LOG: Sending enable_binary_incremental command...")
+	log.Printf("BLE_LOG: Sending enable_binary_incremental command (binary, ID: %d)...", messageID)
 	
 	charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
 	options := make(map[string]interface{})
 	
-	if err := charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err; err != nil {
+	if err := charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdData, options).Err; err != nil {
 		return fmt.Errorf("failed to enable binary protocol: %v", err)
 	}
 	
 	bc.mu.Lock()
 	bc.supportsBinaryProtocol = true
-	bc.binaryProtocolVersion = ProtocolVersion
+	bc.binaryProtocolVersion = BinaryProtocolVersion
 	bc.mu.Unlock()
 	
 	return nil
@@ -2859,35 +3302,27 @@ func getWebPDimensions(data []byte) (width, height int) {
 func (bc *BleClient) SendTestAlbumArtRequest() error {
 	// First request high priority connection
 	log.Printf("BLE_LOG: Requesting high priority connection for test transfer")
-	highPriorityCmd := map[string]interface{}{
-		"command": "request_high_priority_connection",
-		"reason": "test_album_art_transfer",
-	}
-	if cmdJson, err := json.Marshal(highPriorityCmd); err == nil {
-		bc.mu.RLock()
-		if bc.conn != nil && bc.commandRxCharPath != "" {
-			charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
-			options := make(map[string]interface{})
-			charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options)
-		}
-		bc.mu.RUnlock()
-		
-		// Give it a moment to apply
-		time.Sleep(100 * time.Millisecond)
-		
-		// Also try to re-optimize connection parameters
-		go bc.optimizeConnectionParameters()
-	}
 	
-	// Send a special test command that the companion app will recognize
-	cmd := utils.MediaCommand{
-		Command: "test_album_art_request",
+	// Create binary message for high priority connection request
+	messageID := uint16(time.Now().Unix() & 0xFFFF)
+	payload := CreateHighPriorityConnectionPayload("test_album_art_transfer")
+	cmdData := CreateMessage(MsgRequestHighPriorityConnection, payload, messageID)
+	
+	bc.mu.RLock()
+	if bc.conn != nil && bc.commandRxCharPath != "" {
+		charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
+		options := make(map[string]interface{})
+		charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdData, options)
 	}
-	cmdJson, err := json.Marshal(cmd)
-	if err != nil {
-		return fmt.Errorf("failed to marshal test album art request: %v", err)
-	}
-
+	bc.mu.RUnlock()
+	
+	// Give it a moment to apply
+	time.Sleep(100 * time.Millisecond)
+	
+	// Also try to re-optimize connection parameters
+	go bc.optimizeConnectionParameters()
+	
+	// Send test album art request using binary protocol
 	log.Printf("BLE_LOG: Sending test album art request")
 	
 	// Check connection state
@@ -2896,8 +3331,6 @@ func (bc *BleClient) SendTestAlbumArtRequest() error {
 		bc.mu.RUnlock()
 		return fmt.Errorf("BLE connection not established")
 	}
-	conn := bc.conn
-	charPath := bc.commandRxCharPath
 	bc.mu.RUnlock()
 	
 	bc.testAlbumArtMutex.Lock()
@@ -2908,9 +3341,8 @@ func (bc *BleClient) SendTestAlbumArtRequest() error {
 	bc.testAlbumArtTotalChunks = 0
 	bc.testAlbumArtMutex.Unlock()
 	
-	charObj := conn.Object(BLUEZ_BUS_NAME, charPath)
-	options := make(map[string]interface{})
-	return charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err
+	// Use SendCommand to send the test album art request through the proper binary protocol
+	return bc.SendCommand("test_album_art_request", nil, nil)
 }
 
 // GetTestTransferStatus returns the current test transfer status
@@ -3153,20 +3585,16 @@ func (bc *BleClient) optimizeConnectionParameters() error {
 	go func() {
 		time.Sleep(500 * time.Millisecond) // Wait for connection to stabilize
 		
-		// Send a notification about connection optimization
-		cmd := map[string]interface{}{
-			"command": "connection_parameters_updated",
-			"reason": "client_optimization",
-			"target_interval_ms": 7.5,
-			"note": "Car Thing (client) has requested fast connection parameters",
-		}
+		// Send a notification about connection optimization using binary protocol
+		messageID := uint16(time.Now().Unix() & 0xFFFF)
+		payload := CreateOptimizeConnectionParamsPayload(7.5, "client_optimization")
+		cmdData := CreateMessage(MsgOptimizeConnectionParams, payload, messageID)
 		
-		cmdJson, err := json.Marshal(cmd)
-		if err == nil && bc.commandRxCharPath != "" {
+		if bc.commandRxCharPath != "" {
 			charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
 			options := make(map[string]interface{})
-			if err := charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdJson, options).Err; err == nil {
-				log.Println("BLE_LOG: Notified Android app of connection parameter optimization")
+			if err := charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, cmdData, options).Err; err == nil {
+				log.Printf("BLE_LOG: Notified Android app of connection parameter optimization (binary, ID: %d)", messageID)
 			}
 		}
 	}()

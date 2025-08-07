@@ -435,6 +435,15 @@ func (m *BluetoothManager) SendMediaCommand(command string, valueMs *int, valueP
 	// Use BLE client only
 	if m.bleClient != nil && m.bleClient.IsConnected() {
 		log.Printf("Sending media command via BLE: %s", command)
+		
+		// Update local state immediately for play/pause commands
+		switch command {
+		case "play":
+			m.bleClient.UpdateLocalPlayState(true)
+		case "pause":
+			m.bleClient.UpdateLocalPlayState(false)
+		}
+		
 		return m.bleClient.SendCommand(command, valueMs, valuePercent)
 	}
 	
@@ -444,7 +453,7 @@ func (m *BluetoothManager) SendMediaCommand(command string, valueMs *int, valueP
 func (m *BluetoothManager) RequestAlbumArt(trackID string, checksum string) error {
     if m.bleClient != nil && m.bleClient.IsConnected() {
         log.Printf("Requesting album art for track: %s", trackID)
-        return m.bleClient.SendAlbumArtRequest(trackID, checksum)
+        return m.bleClient.SendCommandWithHash("album_art_query", nil, nil, checksum)
     }
     return fmt.Errorf("BLE client not connected")
 }
