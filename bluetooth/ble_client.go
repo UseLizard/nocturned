@@ -51,6 +51,10 @@ type BleClient struct {
 	previousTrackIdentifier string
 	hasNewTimestamp         bool
 	pendingTimestamp        int64
+	
+	// State deduplication
+	lastStateHash           string
+	lastStateTimestamp      time.Time
 
 	// BLE specific fields using D-Bus (matching existing codebase pattern)
 	conn              *dbus.Conn
@@ -1149,6 +1153,13 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 				header.MessageType, GetMessageTypeString(header.MessageType), header.PayloadSize)
 			bc.handleBinaryMessageV2(header, payload)
 			return
+		} else {
+			// Log why binary v2 parsing failed - show first 16 bytes in hex
+			hexBytes := ""
+			for i := 0; i < len(data) && i < 16; i++ {
+				hexBytes += fmt.Sprintf("%02x ", data[i])
+			}
+			log.Printf("BLE_LOG: Binary v2 parse failed: %v (data len: %d, first bytes: %s)", err, len(data), hexBytes)
 		}
 		
 		// Try legacy binary protocol for album art
@@ -1156,6 +1167,9 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 		if err == nil {
 			bc.handleBinaryMessage(legacyHeader, legacyPayload)
 			return
+		} else {
+			// Log why legacy binary parsing failed
+			log.Printf("BLE_LOG: Legacy binary parse failed: %v", err)
 		}
 	}
 	
@@ -1312,6 +1326,18 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 			trackName, artistName, albumName, stateUpdate.IsPlaying, stateUpdate.PositionMs)
 
 		bc.mu.Lock()
+		// Check if track changed and is NOT longer than 10 minutes
+		trackIdentifier := fmt.Sprintf("%s|%s|%s", artistName, albumName, trackName)
+		trackChanged := bc.previousTrackIdentifier != "" && bc.previousTrackIdentifier != trackIdentifier
+		isShortTrack := stateUpdate.DurationMs <= 600000 // 10 minutes or less in milliseconds
+		
+		if trackChanged && isShortTrack {
+			log.Printf("BLE_LOG: Track changed to a short track (<=10min), resetting position to 0. Track: %s, Duration: %dms", 
+				trackName, stateUpdate.DurationMs)
+			stateUpdate.PositionMs = 0
+		}
+		
+		bc.previousTrackIdentifier = trackIdentifier
 		bc.currentState = &stateUpdate
 		// Update the accessible track metadata fields
 		bc.currentTrack = trackName
@@ -2403,7 +2429,39 @@ func (bc *BleClient) handleBinaryMessageV2(header *MessageHeader, payload []byte
 			return
 		}
 		
+		// Create a hash of the state for deduplication
+		stateHash := fmt.Sprintf("%s|%s|%s|%d|%d|%t|%d",
+			state.Artist, state.Album, state.Track,
+			state.DurationMs, state.PositionMs,
+			state.IsPlaying, state.VolumePercent)
+		
 		bc.mu.Lock()
+		
+		// Check for duplicate state within 1 second
+		now := time.Now()
+		if stateHash == bc.lastStateHash && now.Sub(bc.lastStateTimestamp) < 1*time.Second {
+			bc.mu.Unlock()
+			log.Printf("BLE_LOG: Skipping duplicate FullState (received %dms after last identical state)", 
+				now.Sub(bc.lastStateTimestamp).Milliseconds())
+			return
+		}
+		
+		// Update deduplication tracking
+		bc.lastStateHash = stateHash
+		bc.lastStateTimestamp = now
+		
+		// Check if track changed and is NOT longer than 10 minutes
+		trackIdentifier := fmt.Sprintf("%s|%s|%s", state.Artist, state.Album, state.Track)
+		trackChanged := bc.previousTrackIdentifier != "" && bc.previousTrackIdentifier != trackIdentifier
+		isShortTrack := state.DurationMs <= 600000 // 10 minutes or less in milliseconds
+		
+		if trackChanged && isShortTrack {
+			log.Printf("BLE_LOG: Track changed to a short track (<=10min), resetting position to 0. Track: %s, Duration: %dms", 
+				state.Track, state.DurationMs)
+			state.PositionMs = 0
+		}
+		
+		bc.previousTrackIdentifier = trackIdentifier
 		bc.currentArtist = state.Artist
 		bc.currentAlbum = state.Album
 		bc.currentTrack = state.Track
@@ -2452,9 +2510,21 @@ func (bc *BleClient) handleBinaryMessageV2(header *MessageHeader, payload []byte
 	case MsgStateTrack:
 		track := string(payload)
 		bc.mu.Lock()
+		// Check if track changed and is NOT longer than 10 minutes
+		trackIdentifier := fmt.Sprintf("%s|%s|%s", bc.currentArtist, bc.currentAlbum, track)
+		trackChanged := bc.previousTrackIdentifier != "" && bc.previousTrackIdentifier != trackIdentifier
+		
+		bc.previousTrackIdentifier = trackIdentifier
 		bc.currentTrack = track
 		if bc.currentState != nil {
 			bc.currentState.Track = &track
+			
+			// Reset position if track changed and is short
+			if trackChanged && bc.currentState.DurationMs <= 600000 {
+				log.Printf("BLE_LOG: Track changed to a short track (<=10min), resetting position to 0. Track: %s, Duration: %dms", 
+					track, bc.currentState.DurationMs)
+				bc.currentState.PositionMs = 0
+			}
 		}
 		bc.mu.Unlock()
 		log.Printf("BLE_LOG: Track update: %s", track)
@@ -2660,9 +2730,23 @@ func (bc *BleClient) handleBinaryMessage(header *BinaryHeader, payload []byte) {
 		if bc.currentState == nil {
 			bc.currentState = &utils.MediaStateUpdate{}
 		}
+		
+		// Check if track changed and is NOT longer than 10 minutes
+		trackIdentifier := fmt.Sprintf("%s|%s|%s", bc.currentArtist, bc.currentAlbum, track)
+		trackChanged := bc.previousTrackIdentifier != "" && bc.previousTrackIdentifier != trackIdentifier
+		
+		bc.previousTrackIdentifier = trackIdentifier
 		bc.currentState.Track = &track
 		// Update the accessible track metadata field
 		bc.currentTrack = track
+		
+		// Reset position if track changed and is short
+		if trackChanged && bc.currentState.DurationMs <= 600000 {
+			log.Printf("BLE_LOG: Track changed to a short track (<=10min), resetting position to 0. Track: %s, Duration: %dms", 
+				track, bc.currentState.DurationMs)
+			bc.currentState.PositionMs = 0
+		}
+		
 		currentArtist := bc.currentArtist
 		currentAlbum := bc.currentAlbum
 		bc.mu.Unlock()
