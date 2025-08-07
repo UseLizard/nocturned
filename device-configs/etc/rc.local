@@ -1,0 +1,12 @@
+#!/bin/sh
+# Ensure nocturned service directories exist and start the service
+# This runs at boot after all other init scripts
+
+# Create supervise directories if they don't exist
+mkdir -p /run/runit/supervise.nocturned
+mkdir -p /run/runit/supervise.nocturned-log
+
+# Ensure nocturned starts
+sv start nocturned > /dev/null 2>&1 &
+
+exit 0
