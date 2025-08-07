@@ -344,22 +344,23 @@ func main() {
 
 	wsHub := utils.NewWebSocketHub()
 
-	// Retry bluetooth manager initialization with reduced delays
+	// Retry bluetooth manager initialization with increased attempts
 	var btManager *bluetooth.BluetoothManager
 	var err error
-	for retries := 0; retries < 3; retries++ {
+	for retries := 0; retries < 10; retries++ {
 		btManager, err = bluetooth.NewBluetoothManager(wsHub)
 		if err == nil {
+			log.Printf("Bluetooth manager initialized successfully on attempt %d", retries+1)
 			break
 		}
-		log.Printf("Failed to initialize bluetooth manager (attempt %d/3): %v", retries+1, err)
-		if retries < 2 {
-			time.Sleep(1 * time.Second) // Fixed 1 second delay
+		log.Printf("Failed to initialize bluetooth manager (attempt %d/10): %v", retries+1, err)
+		if retries < 9 {
+			time.Sleep(3 * time.Second) // Wait 3 seconds between retries
 		}
 	}
 	
 	if btManager == nil {
-		log.Printf("ERROR: Could not initialize bluetooth manager after 3 attempts - continuing without BLE")
+		log.Printf("ERROR: Could not initialize bluetooth manager after 10 attempts - continuing without BLE")
 		// Continue running without bluetooth rather than crashing
 	}
 	
@@ -433,6 +434,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.SetDiscoverable(true); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to enable discoverable mode: " + err.Error()})
@@ -451,6 +457,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.SetDiscoverable(false); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to disable discoverable mode"})
@@ -468,6 +479,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.AcceptPairing(); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to accept pairing"})
@@ -485,6 +501,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.DenyPairing(); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to deny pairing"})
@@ -509,6 +530,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		info, err := btManager.GetDeviceInfo(address)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -538,6 +564,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.RemoveDevice(address); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to remove device: " + err.Error()})
@@ -562,6 +593,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.ConnectDevice(address); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to connect to device: " + err.Error()})
@@ -587,6 +623,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.DisconnectDevice(address); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to disconnect device: " + err.Error()})
@@ -631,6 +672,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.ConnectNetwork(address); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to connect to Bluetooth network: " + err.Error()})
@@ -649,6 +695,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		devices, err := btManager.GetDevices()
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1019,6 +1070,12 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{"connected": false, "state": nil})
+			return
+		}
 		state := btManager.GetMediaState()
 		connected := btManager.IsMediaConnected()
 
@@ -1042,6 +1099,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.SendMediaCommand("play", nil, nil); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send play command: " + err.Error()})
@@ -1060,6 +1122,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.SendMediaCommand("pause", nil, nil); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send pause command: " + err.Error()})
@@ -1078,6 +1145,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.SendMediaCommand("next", nil, nil); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send next command: " + err.Error()})
@@ -1096,6 +1168,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.SendMediaCommand("previous", nil, nil); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send previous command: " + err.Error()})
@@ -1122,6 +1199,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		if err := btManager.SendMediaCommand("seek_to", &position, nil); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to send seek command: " + err.Error()})
@@ -1154,6 +1236,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		// Update local state immediately for instant UI feedback
 		btManager.UpdateLocalVolume(volume)
 		
@@ -1207,6 +1294,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		// We don't have it, send a NACK to request the full data
 		if err := btManager.RequestAlbumArt(req.TrackID, req.Checksum); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1529,6 +1621,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		bleClient := btManager.GetBleClient()
 		if bleClient == nil || !bleClient.IsConnected() {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -1564,6 +1661,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		bleClient := btManager.GetBleClient()
 		if bleClient == nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -1632,6 +1734,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		bleClient := btManager.GetBleClient()
 		if bleClient == nil {
 			w.WriteHeader(http.StatusOK)
@@ -1662,6 +1769,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		bleClient := btManager.GetBleClient()
 		if bleClient == nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1695,6 +1807,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		bleClient := btManager.GetBleClient()
 		if bleClient == nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1743,6 +1860,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		profileManager := btManager.GetProfileManager()
 		if profileManager == nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1779,6 +1901,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		profileManager := btManager.GetProfileManager()
 		if profileManager == nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1811,6 +1938,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		profileManager := btManager.GetProfileManager()
 		if profileManager == nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1846,6 +1978,11 @@ func main() {
 		address := pathParts[0]
 		profileUUID := pathParts[1]
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		profileManager := btManager.GetProfileManager()
 		if profileManager == nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1878,6 +2015,11 @@ func main() {
 			return
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		profileManager := btManager.GetProfileManager()
 		if profileManager == nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1920,6 +2062,11 @@ func main() {
 			}
 		}
 
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
 		profileManager := btManager.GetProfileManager()
 		if profileManager == nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1949,9 +2096,11 @@ func main() {
 		}
 
 		// Disconnect BLE
-		if bleClient := btManager.GetBleClient(); bleClient != nil {
-			bleClient.Disconnect()
-			log.Println("BLE disconnected for reconnection")
+		if btManager != nil {
+			if bleClient := btManager.GetBleClient(); bleClient != nil {
+				bleClient.Disconnect()
+				log.Println("BLE disconnected for reconnection")
+			}
 		}
 
 		w.WriteHeader(http.StatusOK)

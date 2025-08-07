@@ -75,9 +75,15 @@ sshpass -p "$CAR_THING_PASSWORD" scp $BINARY_NAME root@$CAR_THING_IP:/usr/local/
 echo_info "Deploying binary to /usr/local/sbin/..."
 sshpass -p "$CAR_THING_PASSWORD" scp $BINARY_NAME root@$CAR_THING_IP:/usr/local/sbin/
 
+echo_info "Deploying binary to /usr/bin/..."
+sshpass -p "$CAR_THING_PASSWORD" scp $BINARY_NAME root@$CAR_THING_IP:/usr/bin/
+
+echo_info "Deploying binary to /usr/sbin/..."
+sshpass -p "$CAR_THING_PASSWORD" scp $BINARY_NAME root@$CAR_THING_IP:/usr/sbin/
+
 # Step 5: Make binaries executable
 echo_info "Making binaries executable..."
-sshpass -p "$CAR_THING_PASSWORD" ssh root@$CAR_THING_IP "chmod +x /usr/local/bin/$BINARY_NAME /usr/local/sbin/$BINARY_NAME"
+sshpass -p "$CAR_THING_PASSWORD" ssh root@$CAR_THING_IP "chmod +x /usr/local/bin/$BINARY_NAME /usr/local/sbin/$BINARY_NAME /usr/bin/$BINARY_NAME /usr/sbin/$BINARY_NAME"
 
 # Step 6: Start the service
 echo_info "Starting nocturned service..."

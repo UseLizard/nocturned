@@ -10,14 +10,42 @@ if [ ! -f /sys/class/gpio/gpio493/direction ]; then
   echo out > /sys/class/gpio/gpio493/direction
 fi
 
-# Pull the gpio pin down to reset chip
-echo 0 > /sys/class/gpio/gpio493/value
-sleep 0.1
+# Function to reset Bluetooth chip
+reset_bluetooth_chip() {
+  echo "Resetting Bluetooth chip..."
+  # Pull the gpio pin down to reset chip
+  echo 0 > /sys/class/gpio/gpio493/value
+  sleep 0.5
+  # Turn off reset
+  echo 1 > /sys/class/gpio/gpio493/value
+  # Give the chip more time to start
+  sleep 1
+}
 
-# Turn off reset
-echo 1 > /sys/class/gpio/gpio493/value
+# Try to attach Bluetooth, with retries if it fails
+for attempt in 1 2 3; do
+  echo "Bluetooth adapter initialization attempt $attempt/3"
+  reset_bluetooth_chip
+  
+  # Try to attach the Bluetooth chip
+  /usr/bin/btattach -P bcm -B /dev/ttyS1 &
+  BTPID=$!
+  
+  # Wait a bit and check if it worked
+  sleep 3
+  
+  # Check if hci0 exists and is working
+  if bluetoothctl list 2>/dev/null | grep -q Controller; then
+    echo "Bluetooth adapter initialized successfully"
+    # Keep btattach running
+    wait $BTPID
+    exit 0
+  else
+    echo "Bluetooth adapter failed to initialize, attempt $attempt"
+    kill $BTPID 2>/dev/null
+    sleep 2
+  fi
+done
 
-# Give the chip some time to start
-sleep 0.3
-
-exec /usr/bin/btattach -P bcm -B /dev/ttyS1 > /dev/null 2>&1
+echo "Failed to initialize Bluetooth adapter after 3 attempts"
+exit 1
