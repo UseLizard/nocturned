@@ -427,49 +427,8 @@ func main() {
 	}))
 
 	// POST /bluetooth/discover/on
-	http.HandleFunc("/bluetooth/discover/on", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
-			return
-		}
-
-		if btManager == nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
-			return
-		}
-		if err := btManager.SetDiscoverable(true); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to enable discoverable mode: " + err.Error()})
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
-	}))
-
-	// POST /bluetooth/discover/off
-	http.HandleFunc("/bluetooth/discover/off", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
-			return
-		}
-
-		if btManager == nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
-			return
-		}
-		if err := btManager.SetDiscoverable(false); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to disable discoverable mode"})
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-	}))
+	// Discoverable mode endpoints removed - nocturned is a BLE central/client only
+	// It scans for and connects to peripherals, it doesn't need to advertise
 
 	// POST /bluetooth/pairing/accept
 	http.HandleFunc("/bluetooth/pairing/accept", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
@@ -1724,6 +1683,39 @@ func main() {
 		// Write the image data
 		w.WriteHeader(http.StatusOK)
 		w.Write(data)
+	}))
+
+	// POST /api/test/bt-speed/start - start BT speed test
+	http.HandleFunc("/api/test/bt-speed/start", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
+
+		bleClient := btManager.GetBleClient()
+		if bleClient == nil || !bleClient.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "BLE not connected"})
+			return
+		}
+
+		// Send speed test start command to Android companion
+		err := bleClient.SendSpeedTestStart()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("Failed to start speed test: %v", err)})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "started"})
 	}))
 
 	// GET /media/ble/status

@@ -173,20 +173,22 @@ func (m *BluetoothManager) setPower(enable bool) error {
 		BLUEZ_ADAPTER_INTERFACE, "Powered", dbus.MakeVariant(enable)).Err
 }
 
-func (m *BluetoothManager) SetDiscoverable(enable bool) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	obj := m.conn.Object(BLUEZ_BUS_NAME, m.adapter)
-
-	if err := obj.Call("org.freedesktop.DBus.Properties.Set", 0,
-		BLUEZ_ADAPTER_INTERFACE, "Discoverable", dbus.MakeVariant(enable)).Err; err != nil {
-		return err
-	}
-
-	return obj.Call("org.freedesktop.DBus.Properties.Set", 0,
-		BLUEZ_ADAPTER_INTERFACE, "Pairable", dbus.MakeVariant(enable)).Err
-}
+// SetDiscoverable is disabled - nocturned is a BLE central/client only
+// It scans for and connects to peripherals, it doesn't need to advertise
+// func (m *BluetoothManager) SetDiscoverable(enable bool) error {
+// 	m.mu.Lock()
+// 	defer m.mu.Unlock()
+//
+// 	obj := m.conn.Object(BLUEZ_BUS_NAME, m.adapter)
+//
+// 	if err := obj.Call("org.freedesktop.DBus.Properties.Set", 0,
+// 		BLUEZ_ADAPTER_INTERFACE, "Discoverable", dbus.MakeVariant(enable)).Err; err != nil {
+// 		return err
+// 	}
+//
+// 	return obj.Call("org.freedesktop.DBus.Properties.Set", 0,
+// 		BLUEZ_ADAPTER_INTERFACE, "Pairable", dbus.MakeVariant(enable)).Err
+// }
 
 func formatDevicePath(adapter dbus.ObjectPath, address string) dbus.ObjectPath {
 	formattedAddress := strings.ReplaceAll(address, ":", "_")
