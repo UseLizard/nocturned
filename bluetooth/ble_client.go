@@ -1,12 +1,15 @@
 package bluetooth
 
 import (
+	"bytes"
+	"compress/gzip"
 	//"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	//"encoding/hex"
 	"encoding/json" // Still needed for legacy fallback
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -97,6 +100,10 @@ type BleClient struct {
 	albumArtStartTime time.Time      // Track transfer timing
 	albumArtMutex     sync.Mutex
 	
+	// Weather data management
+	weatherState      *utils.WeatherState
+	weatherMutex      sync.RWMutex
+	
 	// Binary protocol support
 	supportsBinaryProtocol bool
 	binaryProtocolVersion  byte
@@ -120,6 +127,17 @@ type BleClient struct {
 	testAlbumArtStartTime time.Time
 	testAlbumArtMutex     sync.Mutex
 	testAlbumArtLastProgressUpdate int // Track last progress percentage for throttling
+	
+	// Weather binary transfer management
+	weatherBinaryReceiving     bool
+	weatherBinaryBuffer        []byte
+	weatherBinaryChunks        map[int][]byte
+	weatherBinaryChecksum      string
+	weatherBinaryTotalChunks   int
+	weatherBinaryMode          string // "hourly" or "weekly"
+	weatherBinaryLocation      string
+	weatherBinaryStartTime     time.Time
+	weatherBinaryMutex         sync.Mutex
 	
 	// PHY mode tracking
 	currentPHYMode string // "1M PHY", "2M PHY", or "Unknown"
@@ -1401,6 +1419,20 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 			}
 		}
 		
+	case "weatherUpdate":
+		// Weather update from Android
+		var weatherUpdate utils.WeatherUpdate
+		if err := json.Unmarshal(data, &weatherUpdate); err != nil {
+			log.Printf("BLE_LOG: Failed to parse weather update: %v (data: %s)", err, string(data))
+			return
+		}
+		
+		log.Printf("BLE_LOG: Received weather update - Mode: %s, Location: %s", 
+			weatherUpdate.Mode, weatherUpdate.Location.Name)
+		
+		// Store weather data and broadcast to WebSocket clients
+		bc.handleWeatherUpdate(&weatherUpdate)
+		
 	case "stateUpdate":
 		// Media state update
 		var stateUpdate utils.MediaStateUpdate
@@ -1724,6 +1756,261 @@ func (bc *BleClient) handleNotificationData(data []byte, charType string) {
 	}
 }
 
+// handleWeatherUpdate processes incoming weather data from Android
+func (bc *BleClient) handleWeatherUpdate(update *utils.WeatherUpdate) {
+	bc.weatherMutex.Lock()
+	
+	// Initialize weather state if needed
+	if bc.weatherState == nil {
+		bc.weatherState = &utils.WeatherState{}
+	}
+	
+	// Store weather data based on mode
+	var shouldSaveData bool
+	if update.Mode == "hourly" {
+		bc.weatherState.HourlyData = update
+		log.Printf("BLE_LOG: Stored hourly weather data for %s (%d hours)", 
+			update.Location.Name, len(update.Hours))
+		// Check if we have both hourly and weekly data to save
+		shouldSaveData = bc.weatherState.WeeklyData != nil
+	} else if update.Mode == "weekly" {
+		bc.weatherState.WeeklyData = update
+		log.Printf("BLE_LOG: Stored weekly weather data for %s (%d days)", 
+			update.Location.Name, len(update.Days))
+		// Check if we have both hourly and weekly data to save
+		shouldSaveData = bc.weatherState.HourlyData != nil
+	}
+	
+	bc.weatherState.LastUpdate = time.Now()
+	
+	// Save weather data to timestamped folder if we have both types
+	if shouldSaveData {
+		if err := utils.SaveWeatherData(bc.weatherState.HourlyData, bc.weatherState.WeeklyData); err != nil {
+			log.Printf("BLE_LOG: Failed to save weather data: %v", err)
+		} else {
+			log.Printf("BLE_LOG: Weather data saved to timestamped folder for %s", update.Location.Name)
+		}
+	}
+	
+	bc.weatherMutex.Unlock()
+	
+	// Broadcast weather update to WebSocket clients
+	if bc.wsHub != nil {
+		bc.wsHub.Broadcast(utils.WebSocketEvent{
+			Type:    "weather/update",
+			Payload: update,
+		})
+	}
+}
+
+// GetWeatherState returns the current weather state (thread-safe)
+func (bc *BleClient) GetWeatherState() *utils.WeatherState {
+	bc.weatherMutex.RLock()
+	defer bc.weatherMutex.RUnlock()
+	
+	if bc.weatherState == nil {
+		return nil
+	}
+	
+	// Return a copy to prevent external modifications
+	state := &utils.WeatherState{
+		LastUpdate: bc.weatherState.LastUpdate,
+		HourlyData: bc.weatherState.HourlyData,
+		WeeklyData: bc.weatherState.WeeklyData,
+	}
+	
+	return state
+}
+
+// RequestWeatherRefresh sends a refresh request to the Android app
+func (bc *BleClient) RequestWeatherRefresh() error {
+	return bc.SendCommand("refresh_weather", nil, nil)
+}
+
+// handleWeatherBinaryStart handles the start of a weather binary transfer
+func (bc *BleClient) handleWeatherBinaryStart(payload []byte) {
+	// Parse weather start payload - match Android's WeatherBinaryEncoder structure
+	if len(payload) < 56 { // originalSize(4) + compressedSize(4) + totalChunks(4) + reserved(4) + timestamp(8) + checksum(32) = 56 bytes minimum
+		log.Printf("BLE_LOG: Weather start payload too small: %d bytes", len(payload))
+		return
+	}
+	
+	// Extract fields from binary payload (matching WeatherBinaryEncoder structure)
+	originalSize := binary.BigEndian.Uint32(payload[0:4])
+	compressedSize := binary.BigEndian.Uint32(payload[4:8]) 
+	totalChunks := binary.BigEndian.Uint32(payload[8:12])
+	_ = binary.BigEndian.Uint32(payload[12:16]) // reserved - unused
+	timestampMs := binary.BigEndian.Uint64(payload[16:24])
+	
+	// Extract checksum (32 bytes SHA-256)
+	checksum := payload[24:56]
+	checksumHex := fmt.Sprintf("%x", checksum)
+	
+	// Extract mode and location (remaining bytes as strings)
+	remainingData := payload[56:]
+	parts := bytes.Split(remainingData, []byte{0}) // Null-terminated strings
+	
+	var mode, location string
+	if len(parts) >= 2 {
+		mode = string(parts[0])
+		location = string(parts[1])
+	}
+	
+	bc.weatherBinaryMutex.Lock()
+	bc.weatherBinaryReceiving = true
+	bc.weatherBinaryBuffer = nil
+	bc.weatherBinaryChunks = make(map[int][]byte)
+	bc.weatherBinaryChecksum = checksumHex
+	bc.weatherBinaryTotalChunks = int(totalChunks)
+	bc.weatherBinaryMode = mode
+	bc.weatherBinaryLocation = location
+	bc.weatherBinaryStartTime = time.Now()
+	bc.weatherBinaryMutex.Unlock()
+	
+	log.Printf("BLE_LOG: Starting weather binary transfer - Mode: %s, Location: %s, Original: %d bytes, Compressed: %d bytes, Chunks: %d, Timestamp: %d",
+		mode, location, originalSize, compressedSize, totalChunks, timestampMs)
+}
+
+// handleWeatherBinaryChunk handles a weather binary chunk
+func (bc *BleClient) handleWeatherBinaryChunk(header *MessageHeader, payload []byte) {
+	chunkIndex := int(header.MessageID) // Use MessageID as chunk index
+	
+	bc.weatherBinaryMutex.Lock()
+	defer bc.weatherBinaryMutex.Unlock()
+	
+	if !bc.weatherBinaryReceiving {
+		return
+	}
+	
+	// Check for duplicate chunks
+	if _, exists := bc.weatherBinaryChunks[chunkIndex]; exists {
+		return
+	}
+	
+	// Store chunk data
+	bc.weatherBinaryChunks[chunkIndex] = payload
+	
+	log.Printf("BLE_LOG: Received weather chunk %d/%d (%d bytes)", 
+		chunkIndex+1, bc.weatherBinaryTotalChunks, len(payload))
+}
+
+// handleWeatherBinaryEnd handles the end of a weather binary transfer
+func (bc *BleClient) handleWeatherBinaryEnd(payload []byte) {
+	if len(payload) < 33 { // 32 bytes checksum + 1 byte success flag
+		log.Printf("BLE_LOG: Weather end payload too small: %d bytes", len(payload))
+		return
+	}
+	
+	checksum := fmt.Sprintf("%x", payload[0:32])
+	success := payload[32] == 1
+	
+	bc.weatherBinaryMutex.Lock()
+	defer bc.weatherBinaryMutex.Unlock()
+	
+	if !bc.weatherBinaryReceiving || bc.weatherBinaryChecksum != checksum {
+		log.Printf("BLE_LOG: Weather transfer end - not receiving or checksum mismatch")
+		return
+	}
+	
+	if !success {
+		log.Printf("BLE_LOG: Weather transfer failed according to sender")
+		bc.resetWeatherBinaryTransfer()
+		return
+	}
+	
+	// Check if we have all chunks
+	if len(bc.weatherBinaryChunks) != bc.weatherBinaryTotalChunks {
+		log.Printf("BLE_LOG: Weather transfer incomplete - received %d/%d chunks", 
+			len(bc.weatherBinaryChunks), bc.weatherBinaryTotalChunks)
+		bc.resetWeatherBinaryTransfer()
+		return
+	}
+	
+	// Process the completed weather data
+	bc.processWeatherBinaryData()
+}
+
+// resetWeatherBinaryTransfer clears the weather transfer state
+func (bc *BleClient) resetWeatherBinaryTransfer() {
+	bc.weatherBinaryReceiving = false
+	bc.weatherBinaryBuffer = nil
+	bc.weatherBinaryChunks = nil
+	bc.weatherBinaryChecksum = ""
+	bc.weatherBinaryTotalChunks = 0
+	bc.weatherBinaryMode = ""
+	bc.weatherBinaryLocation = ""
+}
+
+// processWeatherBinaryData assembles and processes the weather data
+func (bc *BleClient) processWeatherBinaryData() {
+	log.Printf("BLE_LOG: Processing weather binary data...")
+	
+	if len(bc.weatherBinaryChunks) != bc.weatherBinaryTotalChunks {
+		log.Printf("BLE_LOG: Cannot process - missing chunks %d/%d", 
+			len(bc.weatherBinaryChunks), bc.weatherBinaryTotalChunks)
+		bc.resetWeatherBinaryTransfer()
+		return
+	}
+	
+	// Calculate total size
+	totalSize := 0
+	for i := 0; i < bc.weatherBinaryTotalChunks; i++ {
+		chunk, exists := bc.weatherBinaryChunks[i]
+		if !exists {
+			log.Printf("BLE_LOG: Missing weather chunk %d", i)
+			bc.resetWeatherBinaryTransfer()
+			return
+		}
+		totalSize += len(chunk)
+	}
+	
+	// Assemble chunks
+	bc.weatherBinaryBuffer = make([]byte, totalSize)
+	offset := 0
+	for i := 0; i < bc.weatherBinaryTotalChunks; i++ {
+		chunk := bc.weatherBinaryChunks[i]
+		copy(bc.weatherBinaryBuffer[offset:], chunk)
+		offset += len(chunk)
+	}
+	
+	log.Printf("BLE_LOG: Assembled weather binary data - %d bytes from %d chunks", 
+		len(bc.weatherBinaryBuffer), bc.weatherBinaryTotalChunks)
+	
+	// Decompress gzip data
+	gzipReader, err := gzip.NewReader(bytes.NewReader(bc.weatherBinaryBuffer))
+	if err != nil {
+		log.Printf("BLE_LOG: Failed to create gzip reader: %v", err)
+		bc.resetWeatherBinaryTransfer()
+		return
+	}
+	defer gzipReader.Close()
+	
+	decompressedData, err := io.ReadAll(gzipReader)
+	if err != nil {
+		log.Printf("BLE_LOG: Failed to decompress weather data: %v", err)
+		bc.resetWeatherBinaryTransfer()
+		return
+	}
+	
+	// Parse JSON
+	var weatherUpdate utils.WeatherUpdate
+	if err := json.Unmarshal(decompressedData, &weatherUpdate); err != nil {
+		log.Printf("BLE_LOG: Failed to parse weather JSON: %v", err)
+		bc.resetWeatherBinaryTransfer()
+		return
+	}
+	
+	log.Printf("BLE_LOG: Weather binary transfer complete - Mode: %s, Location: %s, Original: %d bytes, Compressed: %d bytes, Compression: %.1f%%", 
+		bc.weatherBinaryMode, bc.weatherBinaryLocation, len(decompressedData), len(bc.weatherBinaryBuffer),
+		(1.0 - float64(len(bc.weatherBinaryBuffer))/float64(len(decompressedData))) * 100.0)
+	
+	// Handle the weather update using existing logic
+	bc.handleWeatherUpdate(&weatherUpdate)
+	
+	// Clean up
+	bc.resetWeatherBinaryTransfer()
+}
+
 // SendCommand queues a command for sending with ACK handling
 func (bc *BleClient) SendCommand(command string, valueMs *int, valuePercent *int) error {
 	return bc.SendCommandWithHash(command, valueMs, valuePercent, "")
@@ -1833,7 +2120,9 @@ func (bc *BleClient) sendCommandImmediate(cmdItem *CommandQueueItem) error {
 	case "test_album_art_request":
 		msgType = MsgCmdTestAlbumArt
 	default:
-		return fmt.Errorf("unknown command type: %s", cmdItem.command)
+		// Fall back to JSON format for unknown commands (including refresh_weather)
+		log.Printf("BLE_LOG: Command %s not in binary protocol, sending as JSON", cmdItem.command)
+		return bc.sendCommandJSON(cmdItem)
 	}
 	
 	// Create command payload
@@ -1917,6 +2206,88 @@ func (bc *BleClient) sendCommandImmediate(cmdItem *CommandQueueItem) error {
 	}
 	
 	return fmt.Errorf("failed to send command after %d attempts: %v", maxRetries, err)
+}
+
+// sendCommandJSON sends a command using JSON format for commands not in binary protocol
+func (bc *BleClient) sendCommandJSON(cmdItem *CommandQueueItem) error {
+	// Create JSON command structure
+	command := map[string]interface{}{
+		"command":    cmdItem.command,
+		"command_id": cmdItem.id,
+		"timestamp":  time.Now().UnixMilli(),
+	}
+	
+	// Add optional values
+	if cmdItem.valueMs != nil {
+		command["value_ms"] = *cmdItem.valueMs
+	}
+	if cmdItem.valuePercent != nil {
+		command["value_percent"] = *cmdItem.valuePercent
+	}
+	if cmdItem.hash != "" {
+		command["hash"] = cmdItem.hash
+	}
+	
+	// Marshal to JSON
+	jsonData, err := json.Marshal(command)
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON command: %v", err)
+	}
+	
+	// Check MTU
+	bc.mu.RLock()
+	currentMTU := bc.mtu
+	bc.mu.RUnlock()
+	
+	effectiveMTU := int(currentMTU - MTUHeaderSize)
+	if len(jsonData) > effectiveMTU {
+		log.Printf("BLE_LOG: WARNING - JSON command size %d exceeds MTU %d, may fail", len(jsonData), effectiveMTU)
+	}
+	
+	log.Printf("BLE_LOG: Sending JSON command: %s (size: %d bytes)", cmdItem.command, len(jsonData))
+	
+	// Send using D-Bus
+	charObj := bc.conn.Object(BLUEZ_BUS_NAME, bc.commandRxCharPath)
+	options := make(map[string]interface{})
+	
+	// Try to send with retries
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("BLE_LOG: Retry attempt %d for JSON command %s", attempt, cmdItem.command)
+			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+		}
+		
+		err = charObj.Call("org.bluez.GattCharacteristic1.WriteValue", 0, jsonData, options).Err
+		if err == nil {
+			bc.lastCommandTime = time.Now()
+			log.Printf("BLE_LOG: JSON command sent successfully via %s", bc.commandRxCharPath)
+			// Clear active command immediately after sending
+			bc.commandQueueMu.Lock()
+			bc.activeCommand = nil
+			bc.commandQueueMu.Unlock()
+			return nil
+		}
+		
+		// Handle common BLE errors
+		if strings.Contains(err.Error(), "ATT error: 0x0e") {
+			log.Printf("BLE_LOG: ATT error 0x0e - characteristic busy, will retry")
+			continue
+		}
+		
+		if strings.Contains(err.Error(), "InProgress") || strings.Contains(err.Error(), "In Progress") {
+			log.Printf("BLE_LOG: Operation in progress, clearing state and retrying...")
+			bc.commandQueueMu.Lock()
+			bc.activeCommand = nil
+			bc.commandQueueMu.Unlock()
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		
+		log.Printf("BLE_LOG: Failed to send JSON command: %v", err)
+	}
+	
+	return fmt.Errorf("failed to send JSON command after %d attempts: %v", maxRetries, err)
 }
 
 // startStatePolling polls the state characteristic for faster updates
@@ -2511,10 +2882,26 @@ func (bc *BleClient) handleBinaryMessageV2(header *MessageHeader, payload []byte
 		}
 		log.Printf("BLE_LOG: Received time sync - Timestamp: %d, Timezone: %s", sync.TimestampMs, sync.Timezone)
 		
-		// Broadcast time sync event
+		// SET THE SYSTEM TIME - THIS IS THE MISSING PIECE
+		if err := utils.SetSystemTime(sync.TimestampMs); err != nil {
+			log.Printf("BLE_LOG: ERROR - Failed to set system time: %v", err)
+		} else {
+			log.Printf("BLE_LOG: Successfully set system time to %d", sync.TimestampMs)
+		}
+		
+		// Optionally set timezone if provided
+		if sync.Timezone != "" {
+			if err := utils.SetTimezone(sync.Timezone); err != nil {
+				log.Printf("BLE_LOG: Warning - Failed to set timezone: %v", err)
+			} else {
+				log.Printf("BLE_LOG: Successfully set timezone to %s", sync.Timezone)
+			}
+		}
+		
+		// Broadcast time sync event with the expected type for UI
 		if bc.wsHub != nil {
 			bc.wsHub.Broadcast(utils.WebSocketEvent{
-				Type: "time_sync",
+				Type: "system/time_updated",  // Changed from "timeSync" to match UI expectations
 				Payload: map[string]interface{}{
 					"timestamp_ms": sync.TimestampMs,
 					"timezone":    sync.Timezone,
@@ -2773,6 +3160,16 @@ func (bc *BleClient) handleBinaryMessageV2(header *MessageHeader, payload []byte
 			enabled = payload[0] == 1
 		}
 		log.Printf("BLE_LOG: Binary incremental updates %s", map[bool]string{true: "enabled", false: "disabled"}[enabled])
+		
+	// Weather binary transfer messages
+	case MsgWeatherStart:
+		bc.handleWeatherBinaryStart(payload)
+		
+	case MsgWeatherChunk:
+		bc.handleWeatherBinaryChunk(header, payload)
+		
+	case MsgWeatherEnd:
+		bc.handleWeatherBinaryEnd(payload)
 		
 	default:
 		log.Printf("BLE_LOG: Unknown binary message type: 0x%04X", header.MessageType)

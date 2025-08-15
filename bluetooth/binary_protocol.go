@@ -70,6 +70,13 @@ const (
 	MsgError              uint16 = 0x0401
 	MsgErrorCommandFailed uint16 = 0x0402
 	MsgErrorInvalidMessage uint16 = 0x0403
+	
+	// Weather messages - must fit in 12 bits (0x000-0xFFF)
+	// Using 0x05xx range for weather
+	MsgWeatherRequest     uint16 = 0x050A  // Request weather refresh
+	MsgWeatherStart       uint16 = 0x0501  // Weather transfer start
+	MsgWeatherChunk       uint16 = 0x0502  // Weather data chunk
+	MsgWeatherEnd         uint16 = 0x0503  // Weather transfer complete
 )
 
 // MessageHeader represents the enhanced 16-byte header for all binary messages
@@ -769,6 +776,16 @@ func GetMessageTypeString(msgType uint16) string {
 		return "AlbumArtChunk"
 	case MsgAlbumArtEnd:
 		return "AlbumArtEnd"
+		
+	// Weather messages
+	case MsgWeatherRequest:
+		return "WeatherRequest"
+	case MsgWeatherStart:
+		return "WeatherStart"
+	case MsgWeatherChunk:
+		return "WeatherChunk"
+	case MsgWeatherEnd:
+		return "WeatherEnd"
 		
 	// Error messages
 	case MsgError:

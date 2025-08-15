@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -2109,7 +2110,7 @@ func main() {
 
 		// Send time sync request via BLE
 		if bleClient := btManager.GetBleClient(); bleClient != nil {
-			if err := bleClient.SendCommand("request_time_sync", nil, nil); err != nil {
+			if err := bleClient.SendCommand("request_timestamp", nil, nil); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to request time sync: " + err.Error()})
 				return
@@ -2147,6 +2148,216 @@ func main() {
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "track_refresh_requested"})
+	}))
+
+	// GET /api/weather/data - Get weather data with smart caching and refresh logic
+	http.HandleFunc("/api/weather/data", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		// Check cache and filesystem for recent weather data
+		isRecentData := func(weatherData *utils.WeatherUpdate) bool {
+			if weatherData == nil || weatherData.Timestamp == 0 {
+				return false
+			}
+			oneHour := int64(60 * 60 * 1000) // 1 hour in milliseconds
+			now := time.Now().UnixMilli()
+			dataAge := now - weatherData.Timestamp
+			return dataAge < oneHour
+		}
+
+		// Try to get weather data from memory first
+		var weatherState *utils.WeatherState
+		if btManager != nil {
+			bleClient := btManager.GetBleClient()
+			if bleClient != nil {
+				weatherState = bleClient.GetWeatherState()
+			}
+		}
+
+		// Check if we have recent data in memory
+		if weatherState != nil && weatherState.HourlyData != nil && isRecentData(weatherState.HourlyData) {
+			log.Printf("Serving recent weather data from memory")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(weatherState.HourlyData)
+			return
+		}
+
+		// Try to load from filesystem
+		hourlyPath := filepath.Join("/var/nocturne/weather", "hourly_weather.json")
+		if hourlyData, _, err := utils.LoadWeatherFile(hourlyPath); err == nil {
+			if isRecentData(hourlyData) {
+				log.Printf("Serving recent weather data from filesystem")
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(hourlyData)
+				return
+			}
+		}
+
+		// No recent data found - request fresh data from companion app
+		log.Printf("No recent weather data found, requesting refresh from companion app")
+		if btManager != nil {
+			bleClient := btManager.GetBleClient()
+			if bleClient != nil && bleClient.IsConnected() {
+				// Request fresh weather data
+				if err := bleClient.RequestWeatherRefresh(); err != nil {
+					log.Printf("Failed to request weather refresh: %v", err)
+				} else {
+					log.Printf("Weather refresh requested from companion app")
+				}
+			}
+		}
+
+		// Return empty response indicating refresh was triggered
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"status": "refresh_requested"})
+	}))
+
+	// GET /api/weather/current - Get current weather data
+	http.HandleFunc("/api/weather/current", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		// Try to get weather data from memory first
+		weatherState := &utils.WeatherState{}
+		
+		if btManager != nil {
+			bleClient := btManager.GetBleClient()
+			if bleClient != nil {
+				memoryWeatherState := bleClient.GetWeatherState()
+				if memoryWeatherState != nil {
+					weatherState = memoryWeatherState
+				}
+			}
+		}
+
+		// Also try to load from files
+		hourlyPath := filepath.Join("/var/nocturne/weather", "hourly_weather.json")
+		weeklyPath := filepath.Join("/var/nocturne/weather", "weekly_weather.json")
+		
+		if hourlyData, _, err := utils.LoadWeatherFile(hourlyPath); err == nil {
+			weatherState.HourlyData = hourlyData
+		}
+		
+		if weeklyData, _, err := utils.LoadWeatherFile(weeklyPath); err == nil {
+			weatherState.WeeklyData = weeklyData
+		}
+
+		// If no weather data found anywhere
+		if weatherState.HourlyData == nil && weatherState.WeeklyData == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "No weather data available"})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(weatherState)
+	}))
+
+	// POST /api/weather/refresh - Request weather refresh from companion
+	http.HandleFunc("/api/weather/refresh", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		if btManager == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Bluetooth not initialized"})
+			return
+		}
+
+		bleClient := btManager.GetBleClient()
+		if bleClient == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "BLE not connected"})
+			return
+		}
+
+		if err := bleClient.RequestWeatherRefresh(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to request weather refresh: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "weather_refresh_requested"})
+	}))
+
+	// POST /api/screenshot - Take server-side screenshot
+	http.HandleFunc("/api/screenshot", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		// Create screenshots directory
+		screenshotDir := "/var/nocturne/screenshots"
+		if err := os.MkdirAll(screenshotDir, 0755); err != nil {
+			log.Printf("Failed to create screenshot directory: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to create screenshot directory"})
+			return
+		}
+
+		// Generate filename with timestamp
+		timestamp := time.Now().Format("2006-01-02T15-04-05-000Z")
+		filename := fmt.Sprintf("screenshot_%s.png", timestamp)
+		filePath := filepath.Join(screenshotDir, filename)
+
+		// Method 1: Try Chrome DevTools Protocol first
+		screenshotTaken := false
+		
+		// Try to find Chrome process and get debug port
+		if chromeDebugPort := findChromeDebugPort(); chromeDebugPort != 0 {
+			if err := takeScreenshotViaDevTools(chromeDebugPort, filePath); err == nil {
+				screenshotTaken = true
+				log.Printf("Screenshot taken via Chrome DevTools: %s", filePath)
+			} else {
+				log.Printf("Chrome DevTools screenshot failed: %v", err)
+			}
+		}
+
+		// Method 2: Try wkhtmltoimage if Chrome DevTools failed
+		if !screenshotTaken {
+			if err := takeScreenshotViaWkhtml(filePath); err == nil {
+				screenshotTaken = true
+				log.Printf("Screenshot taken via wkhtmltoimage: %s", filePath)
+			} else {
+				log.Printf("wkhtmltoimage screenshot failed: %v", err)
+			}
+		}
+
+		// Method 3: Try xvfb-run with cutycapt as last resort
+		if !screenshotTaken {
+			if err := takeScreenshotViaXvfb(filePath); err == nil {
+				screenshotTaken = true
+				log.Printf("Screenshot taken via xvfb: %s", filePath)
+			} else {
+				log.Printf("xvfb screenshot failed: %v", err)
+			}
+		}
+
+		if screenshotTaken {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "success",
+				"filename": filename,
+				"path": filePath,
+				"method": "server-side",
+			})
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "All screenshot methods failed"})
+		}
 	}))
 
 	// POST /api/device/reboot - Reboot the device
@@ -2236,4 +2447,185 @@ func detectImageFormat(data []byte) string {
 	
 	// Default to JPEG if unknown
 	return "image/jpeg"
+}
+
+// Helper functions for screenshot functionality
+func findChromeDebugPort() int {
+	// Look for Chrome processes with debug port
+	cmd := exec.Command("ps", "aux")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "chromium") && strings.Contains(line, "--remote-debugging-port") {
+			// Extract port number from command line
+			parts := strings.Fields(line)
+			for i, part := range parts {
+				if part == "--remote-debugging-port" || strings.HasPrefix(part, "--remote-debugging-port=") {
+					var portStr string
+					if part == "--remote-debugging-port" && i+1 < len(parts) {
+						portStr = parts[i+1]
+					} else if strings.HasPrefix(part, "--remote-debugging-port=") {
+						portStr = strings.Split(part, "=")[1]
+					}
+					if port, err := strconv.Atoi(portStr); err == nil {
+						return port
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func takeScreenshotViaDevTools(port int, filePath string) error {
+	// First, get the list of tabs to find the active one
+	tabsURL := fmt.Sprintf("http://localhost:%d/json", port)
+	
+	// Get tabs
+	cmd := exec.Command("curl", "-s", tabsURL)
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get tabs: %v", err)
+	}
+	
+	// Parse JSON to find the first tab
+	var tabs []map[string]interface{}
+	if err := json.Unmarshal(output, &tabs); err != nil {
+		return fmt.Errorf("failed to parse tabs JSON: %v", err)
+	}
+	
+	if len(tabs) == 0 {
+		return fmt.Errorf("no tabs found")
+	}
+	
+	// Get the first tab's websocket URL
+	tab := tabs[0]
+	_, ok := tab["webSocketDebuggerUrl"].(string)
+	if !ok {
+		return fmt.Errorf("no websocket URL found for tab")
+	}
+	
+	// Take screenshot using Page.captureScreenshot
+	screenshotCmd := fmt.Sprintf(`
+		curl -s -X POST -H "Content-Type: application/json" \
+		-d '{"id":1,"method":"Page.captureScreenshot","params":{"format":"png","quality":100}}' \
+		http://localhost:%d/json/runtime/evaluate 2>/dev/null
+	`, port)
+	
+	// Execute screenshot command
+	cmd = exec.Command("sh", "-c", screenshotCmd)
+	screenshotOutput, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("screenshot command failed: %v", err)
+	}
+	
+	// Parse response to get base64 image data
+	var response map[string]interface{}
+	if err := json.Unmarshal(screenshotOutput, &response); err != nil {
+		// If JSON parsing fails, try a different approach
+		return takeScreenshotViaSimpleCurl(port, filePath)
+	}
+	
+	// Extract base64 data from response
+	if result, ok := response["result"].(map[string]interface{}); ok {
+		if data, ok := result["data"].(string); ok {
+			// Decode base64 and save to file
+			imageData, err := base64.StdEncoding.DecodeString(data)
+			if err != nil {
+				return fmt.Errorf("failed to decode base64: %v", err)
+			}
+			
+			return os.WriteFile(filePath, imageData, 0644)
+		}
+	}
+	
+	return fmt.Errorf("no image data found in response")
+}
+
+func takeScreenshotViaSimpleCurl(port int, filePath string) error {
+	// Simpler approach: just save a rendered HTML to image using curl
+	// This is a fallback method
+	htmlFile := "/tmp/screenshot.html"
+	
+	// Create a simple HTML file that captures the current page
+	htmlContent := fmt.Sprintf(`
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body { margin: 0; padding: 0; background: black; }
+        iframe { width: 100vw; height: 100vh; border: none; }
+    </style>
+</head>
+<body>
+    <iframe src="http://localhost:5000"></iframe>
+</body>
+</html>`)
+	
+	if err := os.WriteFile(htmlFile, []byte(htmlContent), 0644); err != nil {
+		return fmt.Errorf("failed to create HTML file: %v", err)
+	}
+	
+	// Try to trigger a screenshot by evaluating JavaScript
+	jsCode := fmt.Sprintf(`
+		// Try to trigger download of current page as image
+		const canvas = document.createElement('canvas');
+		const ctx = canvas.getContext('2d');
+		canvas.width = window.innerWidth || 800;
+		canvas.height = window.innerHeight || 480;
+		
+		// Fill with current background
+		ctx.fillStyle = getComputedStyle(document.body).background || '#000000';
+		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		
+		// Convert to blob and trigger download
+		canvas.toBlob(function(blob) {
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = 'screenshot.png';
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			URL.revokeObjectURL(url);
+		});
+	`)
+	
+	evalURL := fmt.Sprintf("http://localhost:%d/json/runtime/evaluate", port)
+	payload := map[string]interface{}{
+		"expression": jsCode,
+	}
+	
+	jsonData, _ := json.Marshal(payload)
+	cmd := exec.Command("curl", "-s", "-X", "POST", "-H", "Content-Type: application/json", 
+		"-d", string(jsonData), evalURL)
+	
+	return cmd.Run()
+}
+
+func takeScreenshotViaWkhtml(filePath string) error {
+	// Use wkhtmltoimage to capture the page
+	cmd := exec.Command("wkhtmltoimage", 
+		"--width", "800",
+		"--height", "480", 
+		"--disable-smart-width",
+		"http://localhost:5000", 
+		filePath)
+	return cmd.Run()
+}
+
+func takeScreenshotViaXvfb(filePath string) error {
+	// Use xvfb-run with cutycapt
+	cmd := exec.Command("xvfb-run", "-a", "-s", "-screen 0 800x480x24",
+		"cutycapt", 
+		"--url=http://localhost:5000",
+		"--out=" + filePath,
+		"--min-width=800",
+		"--min-height=480")
+	return cmd.Run()
 }
