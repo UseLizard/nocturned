@@ -77,6 +77,10 @@ const (
 	MsgWeatherStart       uint16 = 0x0501  // Weather transfer start
 	MsgWeatherChunk       uint16 = 0x0502  // Weather data chunk
 	MsgWeatherEnd         uint16 = 0x0503  // Weather transfer complete
+	
+	// Gradient messages - must fit in 12 bits (0x000-0xFFF)
+	// Using 0x06xx range for gradients
+	MsgGradientColors     uint16 = 0x0601  // Gradient colors data
 )
 
 // MessageHeader represents the enhanced 16-byte header for all binary messages

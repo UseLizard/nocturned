@@ -1,113 +1,69 @@
 package utils
 
 import (
-	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
+	"sync"
 )
 
-// CalculateMD5 calculates the MD5 checksum of the given data
-func CalculateMD5(data []byte) string {
-	hash := md5.Sum(data)
-	return hex.EncodeToString(hash[:])
+// Global in-memory album art storage
+var (
+	currentAlbumArt      []byte
+	currentAlbumArtMutex sync.RWMutex
+)
+
+// SetCurrentAlbumArt updates the global in-memory album art
+func SetCurrentAlbumArt(data []byte) {
+	currentAlbumArtMutex.Lock()
+	// Make a copy to avoid external modifications
+	if data != nil {
+		currentAlbumArt = make([]byte, len(data))
+		copy(currentAlbumArt, data)
+	} else {
+		currentAlbumArt = nil
+	}
+	currentAlbumArtMutex.Unlock()
 }
 
-// CalculateSHA256 calculates the SHA-256 checksum of the given data
-func CalculateSHA256(data []byte) string {
+// GetCurrentAlbumArt returns the current in-memory album art
+func GetCurrentAlbumArt() []byte {
+	currentAlbumArtMutex.RLock()
+	defer currentAlbumArtMutex.RUnlock()
+	// Return the actual data - the HTTP handler will write it directly
+	// This avoids an unnecessary copy
+	return currentAlbumArt
+}
+
+func CheckAlbumArtExists(checksum string) bool {
+	albumArtDir := "/var/nocturne/albumart"
+	filePath := filepath.Join(albumArtDir, checksum+".webp")
+	if _, err := os.Stat(filePath); err == nil {
+		return true
+	}
+	return false
+}
+
+func GetAlbumArtPath(checksum string) string {
+	albumArtDir := "/var/nocturne/albumart"
+	return filepath.Join(albumArtDir, checksum+".webp")
+}
+
+func GenerateAlbumArtHash(data []byte) string {
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:])
 }
 
-// SaveAlbumArt saves album art data to a file with retry logic and graceful degradation
-func SaveAlbumArt(data []byte, filename string) error {
-	// For /tmp files, use simpler logic as /tmp is always available
-	if strings.HasPrefix(filename, "/tmp/") {
-		return saveWithRetry(data, filename, 3)
+func SaveAlbumArt(checksum string, data []byte) (string, error) {
+	albumArtDir := "/var/nocturne/albumart"
+	if err := os.MkdirAll(albumArtDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create album art directory: %w", err)
 	}
-	
-	// For /var files, check if directory is writable first
-	dir := filepath.Dir(filename)
-	
-	// Test if parent directory exists and is writable
-	testFile := filepath.Join(dir, ".test_write")
-	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
-		// Directory not ready, try to create it with retries
-		for attempt := 0; attempt < 3; attempt++ {
-			if err := os.MkdirAll(dir, 0755); err == nil {
-				break
-			}
-			if attempt < 2 {
-				time.Sleep(time.Duration(100*(attempt+1)) * time.Millisecond)
-			}
-		}
-		
-		// Test again
-		if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
-			// Still can't write - gracefully degrade
-			return nil // Don't fail the operation
-		}
+	filePath := GetAlbumArtPath(checksum)
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return "", fmt.Errorf("failed to save album art: %w", err)
 	}
-	os.Remove(testFile)
-	
-	// Directory is writable, save with retry
-	return saveWithRetry(data, filename, 3)
-}
-
-// saveWithRetry attempts to save data with retries
-func saveWithRetry(data []byte, filename string, maxRetries int) error {
-	var lastErr error
-	
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Write to temporary file first
-		tmpFile := filename + ".tmp"
-		if err := os.WriteFile(tmpFile, data, 0644); err == nil {
-			// Atomic rename
-			if err := os.Rename(tmpFile, filename); err == nil {
-				return nil
-			} else {
-				os.Remove(tmpFile)
-				lastErr = err
-			}
-		} else {
-			lastErr = err
-		}
-		
-		if attempt < maxRetries-1 {
-			time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
-		}
-	}
-	
-	return fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
-}
-
-// GenerateAlbumArtHash generates a hash from artist and album names
-func GenerateAlbumArtHash(artist, album string) string {
-	// Normalize strings: lowercase, trim spaces
-	artist = strings.TrimSpace(strings.ToLower(artist))
-	album = strings.TrimSpace(strings.ToLower(album))
-	
-	// Combine artist and album
-	combined := artist + "-" + album
-	
-	// Generate MD5 hash
-	hash := md5.Sum([]byte(combined))
-	return hex.EncodeToString(hash[:])
-}
-
-// GetAlbumArtPath returns the path for cached album art
-func GetAlbumArtPath(artist, album string) string {
-	hash := GenerateAlbumArtHash(artist, album)
-	return filepath.Join("/var/nocturne/albumart", hash + ".jpg")
-}
-
-// CheckAlbumArtExists checks if album art is already cached
-func CheckAlbumArtExists(artist, album string) bool {
-	path := GetAlbumArtPath(artist, album)
-	_, err := os.Stat(path)
-	return err == nil
+	return filePath, nil
 }

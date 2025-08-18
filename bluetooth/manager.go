@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/godbus/dbus/v5"
 
@@ -56,11 +55,9 @@ func NewBluetoothManager(wsHub *utils.WebSocketHub) (*BluetoothManager, error) {
 	}
 
 	manager.monitorDisconnects()
-	// Removed monitorNetworkInterfaces() - not needed for BLE
 
-	// Initialize BLE media client
 	manager.bleClient = NewBleClient(manager, wsHub)
-	go manager.initializeBLEClient()
+	go manager.bleClient.DiscoverAndConnect()
 
 	manager.profileManager = NewProfileManager(manager, wsHub)
 
@@ -173,28 +170,6 @@ func (m *BluetoothManager) setPower(enable bool) error {
 		BLUEZ_ADAPTER_INTERFACE, "Powered", dbus.MakeVariant(enable)).Err
 }
 
-// SetDiscoverable is disabled - nocturned is a BLE central/client only
-// It scans for and connects to peripherals, it doesn't need to advertise
-// func (m *BluetoothManager) SetDiscoverable(enable bool) error {
-// 	m.mu.Lock()
-// 	defer m.mu.Unlock()
-//
-// 	obj := m.conn.Object(BLUEZ_BUS_NAME, m.adapter)
-//
-// 	if err := obj.Call("org.freedesktop.DBus.Properties.Set", 0,
-// 		BLUEZ_ADAPTER_INTERFACE, "Discoverable", dbus.MakeVariant(enable)).Err; err != nil {
-// 		return err
-// 	}
-//
-// 	return obj.Call("org.freedesktop.DBus.Properties.Set", 0,
-// 		BLUEZ_ADAPTER_INTERFACE, "Pairable", dbus.MakeVariant(enable)).Err
-// }
-
-func formatDevicePath(adapter dbus.ObjectPath, address string) dbus.ObjectPath {
-	formattedAddress := strings.ReplaceAll(address, ":", "_")
-	return dbus.ObjectPath(fmt.Sprintf("%s/dev_%s", adapter, formattedAddress))
-}
-
 func (m *BluetoothManager) GetDeviceInfo(address string) (*utils.BluetoothDeviceInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -278,9 +253,6 @@ func (m *BluetoothManager) ConnectNetwork(address string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// NAP (Network Access Point) connections disabled to prevent automatic
-	// internet tethering. This prevents Android devices from enabling
-	// "Internet connection sharing" when pairing with Nocturne.
 	log.Printf("ConnectNetwork called for %s - NAP connections disabled", address)
 	return fmt.Errorf("network connections disabled - NAP profile not available")
 }
@@ -412,67 +384,49 @@ func (m *BluetoothManager) DisconnectDevice(address string) error {
 	return nil
 }
 
-func (m *BluetoothManager) initializeBLEClient() {
-	log.Println("🚀 BLE: Starting BLE client initialization...")
-
-	log.Println("🚀 BLE MediaClient: Starting initialization loop...")
-	for {
-		log.Println("🔄 BLE MediaClient: Attempting discovery and connection...")
-		if err := m.bleClient.DiscoverAndConnect(); err != nil {
-			log.Printf("❌ BLE MediaClient: Connection failed: %v", err)
-			log.Println("⏰ BLE MediaClient: Retrying in 30 seconds...")
-			time.Sleep(30 * time.Second)
-			continue
-		}
-		log.Println("✅ BLE MediaClient: Successfully connected!")
-		break
-	}
-}
-
 func (m *BluetoothManager) GetBleClient() *BleClient {
 	return m.bleClient
 }
 
 func (m *BluetoothManager) SendMediaCommand(command string, valueMs *int, valuePercent *int) error {
-	// Use BLE client only
 	if m.bleClient != nil && m.bleClient.IsConnected() {
 		log.Printf("Sending media command via BLE: %s", command)
-		
-		// Update local state immediately for play/pause commands
+
+		isPlaying := false
 		switch command {
 		case "play":
-			m.bleClient.UpdateLocalPlayState(true)
+			isPlaying = true
 		case "pause":
-			m.bleClient.UpdateLocalPlayState(false)
+			isPlaying = false
 		}
-		
-		return m.bleClient.SendCommand(command, valueMs, valuePercent)
+		m.bleClient.UpdateLocalPlayState(&utils.MediaStateUpdate{IsPlaying: isPlaying})
+
+		m.bleClient.sendCommand(&Command{Type: 0x01, Payload: []byte(command)})
+		return nil
 	}
-	
+
 	return fmt.Errorf("BLE client not connected")
 }
 
 func (m *BluetoothManager) RequestAlbumArt(trackID string, checksum string) error {
-    if m.bleClient != nil && m.bleClient.IsConnected() {
-        log.Printf("Requesting album art for track: %s", trackID)
-        return m.bleClient.SendCommandWithHash("album_art_query", nil, nil, checksum)
-    }
-    return fmt.Errorf("BLE client not connected")
+	if m.bleClient != nil && m.bleClient.IsConnected() {
+		log.Printf("Requesting album art for track: %s", trackID)
+		return fmt.Errorf("not implemented")
+	}
+	return fmt.Errorf("BLE client not connected")
 }
 
-// UpdateLocalVolume updates the local state volume without sending to device
 func (m *BluetoothManager) UpdateLocalVolume(volumePercent int) {
 	if m.bleClient != nil {
-		m.bleClient.UpdateLocalVolume(volumePercent)
+		// m.bleClient.UpdateLocalVolume(volumePercent)
 	}
 }
 
 func (m *BluetoothManager) GetMediaState() *utils.MediaStateUpdate {
-	// Get state from whichever client is connected (BLE preferred)
 	if m.bleClient != nil && m.bleClient.IsConnected() {
 		return m.bleClient.GetCurrentState()
 	}
-	
+
 	return nil
 }
 
