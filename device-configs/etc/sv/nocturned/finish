@@ -1,6 +1,0 @@
-#\!/bin/sh
-exec 2>&1
-# Clean shutdown - close any open Bluetooth connections
-pkill -TERM nocturned 2>/dev/null || true
-sleep 2
-exit 0

@@ -1,5 +1,7 @@
 package utils
 
+import "time"
+
 // Bluetooth
 type BluetoothDeviceInfo struct {
 	Address           string `json:"address"`
@@ -143,4 +145,14 @@ type ProfileStateChangedPayload struct {
 
 type ProfileLogPayload struct {
 	Entry ProfileLogEntry `json:"entry"`
+}
+
+// Utility functions for time handling
+
+func GetCurrentTimestampMs() int64 {
+	return time.Now().UnixNano() / int64(time.Millisecond)
+}
+
+func GetCurrentTimezone() string {
+	return time.Now().Location().String()
 }

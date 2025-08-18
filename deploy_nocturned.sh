@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# nocturned deployment script for Car Thing
-# This script builds and deploys the nocturned service to a Car Thing device
+# nocturned v2 deployment script for Car Thing
+# This script builds and deploys the nocturned v2 service to a Car Thing device
 
 set -e  # Exit on any error
 
@@ -28,9 +28,9 @@ echo_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Check if we're in the nocturned directory
-if [ ! -f "main.go" ]; then
-    echo_error "This script must be run from the nocturned directory"
+# Check if we're in the nocturned-v2 directory
+if [ ! -f "main_v2.go" ]; then
+    echo_error "This script must be run from the nocturned-v2 directory"
     exit 1
 fi
 
@@ -40,11 +40,11 @@ if ! command -v sshpass &> /dev/null; then
     exit 1
 fi
 
-echo_info "Starting nocturned deployment to Car Thing..."
+echo_info "Starting nocturned v2 deployment to Car Thing..."
 
 # Step 1: Build the binary for ARM64
-echo_info "Building nocturned binary for ARM64..."
-GOOS=linux GOARCH=arm64 go build -o $BINARY_NAME .
+echo_info "Building nocturned v2 binary for ARM64..."
+GOOS=linux GOARCH=arm64 go build -o $BINARY_NAME main_v2.go
 if [ $? -eq 0 ]; then
     echo_info "Binary built successfully"
 else
@@ -102,16 +102,16 @@ sshpass -p "$CAR_THING_PASSWORD" ssh root@$CAR_THING_IP "sync"
 echo_info "Remounting filesystem as read-only..."
 sshpass -p "$CAR_THING_PASSWORD" ssh root@$CAR_THING_IP "mount -o remount,ro /"
 
-# Step 9: Test API endpoint (optional)
-echo_info "Testing API endpoint..."
-if sshpass -p "$CAR_THING_PASSWORD" ssh root@$CAR_THING_IP "wget -q -O - --timeout=5 http://localhost:5000/bluetooth/status" > /dev/null 2>&1; then
-    echo_info "API endpoint responding correctly"
+# Step 9: Test API endpoint (optional) - Updated for v2
+echo_info "Testing v2 API endpoint..."
+if sshpass -p "$CAR_THING_PASSWORD" ssh root@$CAR_THING_IP "wget -q -O - --timeout=5 http://localhost:5000/api/v2/health" > /dev/null 2>&1; then
+    echo_info "v2 API endpoint responding correctly"
 else
-    echo_warn "API endpoint test failed - service may still be starting"
+    echo_warn "v2 API endpoint test failed - service may still be starting"
 fi
 
 echo_info "Deployment completed successfully!"
-echo_info "nocturned service is now running on Car Thing"
+echo_info "nocturned v2 service is now running on Car Thing"
 echo_info ""
 echo_info "You can check the service status with:"
 echo_info "  sshpass -p \"$CAR_THING_PASSWORD\" ssh root@$CAR_THING_IP \"sv status nocturned\""

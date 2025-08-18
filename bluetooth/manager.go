@@ -3,443 +3,422 @@ package bluetooth
 import (
 	"fmt"
 	"log"
-	"os/exec"
-	"strings"
 	"sync"
+	"time"
 
 	"github.com/godbus/dbus/v5"
-
 	"github.com/usenocturne/nocturned/utils"
 )
 
-type BluetoothManager struct {
-	conn               *dbus.Conn
-	adapter            dbus.ObjectPath
-	agent              *Agent
-	mu                 sync.Mutex
-	pairingRequests    chan utils.PairingRequest
-	wsHub              *utils.WebSocketHub
-	pendingDisconnects sync.Map
-	bleClient          *BleClient      // BLE media client
-	profileManager     *ProfileManager
+// ManagerV2 manages the v2 Bluetooth Low Energy service
+type ManagerV2 struct {
+	mu              sync.RWMutex
+	conn            *dbus.Conn
+	wsHub           *utils.WebSocketHub
+	client          *BleClientV2
+	albumArtHandler *AlbumArtHandler
+	isRunning       bool
+	stopChan        chan struct{}
+	
+	// State
+	currentPlayState    *PlayStateMessage
+	currentVolume       *VolumeMessage
+	currentWeather      *WeatherMessage
+	currentDeviceInfo   *DeviceInfoMessage
+	connectionStatus    *ConnectionStatusMessage
+	
+	// Configuration
+	rateLimitConfig *RateLimitConfig
+	chunkSize       int
+	
+	// Callbacks
+	playStateCallback func(*PlayStateMessage)
+	volumeCallback    func(*VolumeMessage)
+	weatherCallback   func(*WeatherMessage)
 }
 
-func NewBluetoothManager(wsHub *utils.WebSocketHub) (*BluetoothManager, error) {
+// NewManagerV2 creates a new v2 manager instance
+func NewManagerV2(wsHub *utils.WebSocketHub) (*ManagerV2, error) {
 	conn, err := dbus.SystemBus()
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to system bus: %v", err)
+		return nil, fmt.Errorf("failed to connect to system D-Bus: %w", err)
 	}
-	log.Println("Connected to system bus")
-
-	adapter, err := findDefaultAdapter(conn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find bluetooth adapter: %v", err)
-	}
-	log.Printf("Found adapter: %s", adapter)
-
-	manager := &BluetoothManager{
+	
+	manager := &ManagerV2{
 		conn:            conn,
-		adapter:         adapter,
-		pairingRequests: make(chan utils.PairingRequest, 1),
 		wsHub:           wsHub,
+		stopChan:        make(chan struct{}),
+		rateLimitConfig: DefaultRateLimitConfig(),
+		chunkSize:       DefaultChunkSize,
+		connectionStatus: &ConnectionStatusMessage{
+			Status:   ConnectionStateDisconnected,
+			LastSeen: 0,
+		},
 	}
-
-	agent, err := NewAgent(conn, manager)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create agent: %v", err)
-	}
-	manager.agent = agent
-
-	if err := manager.setPower(true); err != nil {
-		return nil, fmt.Errorf("failed to power on adapter: %v", err)
-	}
-
-	manager.monitorDisconnects()
-
-	manager.bleClient = NewBleClient(manager, wsHub)
-	go manager.bleClient.DiscoverAndConnect()
-
-	manager.profileManager = NewProfileManager(manager, wsHub)
-
+	
+	// Initialize album art handler
+	manager.albumArtHandler = NewAlbumArtHandler()
+	manager.albumArtHandler.SetCallback(func(data []byte) {
+		// Store album art in the utils package for other components
+		utils.SetCurrentAlbumArt(data)
+		
+		// Broadcast via WebSocket
+		if manager.wsHub != nil {
+			manager.wsHub.Broadcast(utils.WebSocketEvent{
+				Type: "media/album_art_received",
+				Payload: map[string]interface{}{
+					"size":      len(data),
+					"timestamp": time.Now().Unix(),
+				},
+			})
+		}
+	})
+	
+	// Initialize BLE client
+	manager.client = NewBleClientV2(conn, wsHub)
+	
 	return manager, nil
 }
 
-func findDefaultAdapter(conn *dbus.Conn) (dbus.ObjectPath, error) {
-	if err := conn.AddMatchSignal(
-		dbus.WithMatchObjectPath("/org/freedesktop/DBus"),
-		dbus.WithMatchInterface("org.freedesktop.DBus"),
-		dbus.WithMatchMember("NameOwnerChanged"),
-		dbus.WithMatchArg(0, "org.bluez"),
-	); err != nil {
-		return "", fmt.Errorf("failed to add match: %v", err)
+// Start starts the v2 manager
+func (m *ManagerV2) Start() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	if m.isRunning {
+		return fmt.Errorf("manager already running")
 	}
-
-	var owner string
-	obj := conn.Object("org.freedesktop.DBus", "/org/freedesktop/DBus")
-	err := obj.Call("org.freedesktop.DBus.GetNameOwner", 0, "org.bluez").Store(&owner)
-	if err != nil {
-		return "", fmt.Errorf("failed to get bluez owner: %v", err)
-	}
-
-	if err := conn.AddMatchSignal(
-		dbus.WithMatchSender("org.bluez"),
-		dbus.WithMatchPathNamespace("/"),
-		dbus.WithMatchInterface("org.freedesktop.DBus.ObjectManager"),
-		dbus.WithMatchMember("InterfacesAdded"),
-	); err != nil {
-		return "", fmt.Errorf("failed to add interfaces match: %v", err)
-	}
-
-	var objects map[dbus.ObjectPath]map[string]map[string]dbus.Variant
-	obj = conn.Object("org.bluez", "/")
-	if err := obj.Call("org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&objects); err != nil {
-		return "", fmt.Errorf("failed to get managed objects: %v", err)
-	}
-
-	for path, interfaces := range objects {
-		_, hasAdapter := interfaces["org.bluez.Adapter1"]
-		if hasAdapter {
-			return path, nil
-		}
-	}
-
-	return "", fmt.Errorf("no bluetooth adapter found")
+	
+	log.Println("BT_MGR: Starting Nocturne v2 Manager")
+	
+	// Start the BLE client
+	log.Println("BT_MGR: Starting BLE client...")
+	m.client.Start()
+	log.Println("BT_MGR: BLE client started")
+	
+	// Start background routines
+	log.Println("BT_MGR: Starting background monitoring routines...")
+	go m.monitorConnection()
+	go m.cleanupRoutine()
+	log.Println("BT_MGR: Background routines started")
+	
+	m.isRunning = true
+	log.Println("BT_MGR: Nocturne v2 Manager started successfully")
+	return nil
 }
 
-func (m *BluetoothManager) monitorDisconnects() {
-	if err := m.conn.AddMatchSignal(
-		dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
-		dbus.WithMatchMember("PropertiesChanged"),
-		dbus.WithMatchPathNamespace("/org/bluez"),
-	); err != nil {
-		log.Printf("Failed to add signal match: %v", err)
+// Stop stops the v2 manager
+func (m *ManagerV2) Stop() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	if !m.isRunning {
 		return
 	}
-
-	signals := make(chan *dbus.Signal, 10)
-	m.conn.Signal(signals)
-
-	go func() {
-		for signal := range signals {
-			if signal.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
-				if len(signal.Body) < 3 {
-					continue
-				}
-
-				iface := signal.Body[0].(string)
-				if iface != BLUEZ_DEVICE_INTERFACE {
-					continue
-				}
-
-				changes := signal.Body[1].(map[string]dbus.Variant)
-				if connected, ok := changes["Connected"]; ok {
-					if !connected.Value().(bool) {
-						devicePath := string(signal.Path)
-						address := strings.TrimPrefix(devicePath, string(m.adapter)+"/dev_")
-						address = strings.ReplaceAll(address, "_", ":")
-
-						if _, exists := m.pendingDisconnects.LoadAndDelete(address); !exists {
-							if m.wsHub != nil {
-								m.wsHub.Broadcast(utils.WebSocketEvent{
-									Type: "bluetooth/disconnect",
-									Payload: utils.DeviceDisconnectedPayload{
-										Address: address,
-									},
-								})
-							}
-						}
-
-						log.Printf("Device disconnected: %s", devicePath)
-
-						if m.agent != nil && m.agent.current != nil && m.agent.current.Device == devicePath {
-							m.mu.Lock()
-							m.agent.current = nil
-							m.mu.Unlock()
-						}
-					}
-				}
-			}
-		}
-	}()
+	
+	log.Println("BT_MGR: Stopping Nocturne v2 Manager")
+	
+	// Stop the BLE client
+	log.Println("BT_MGR: Stopping BLE client...")
+	m.client.Stop()
+	log.Println("BT_MGR: BLE client stopped")
+	
+	// Stop background routines
+	log.Println("BT_MGR: Stopping background routines...")
+	close(m.stopChan)
+	log.Println("BT_MGR: Background routines stopped")
+	
+	m.isRunning = false
+	log.Println("BT_MGR: Nocturne v2 Manager stopped")
 }
 
-
-func (m *BluetoothManager) setPower(enable bool) error {
-	obj := m.conn.Object(BLUEZ_BUS_NAME, m.adapter)
-	return obj.Call("org.freedesktop.DBus.Properties.Set", 0,
-		BLUEZ_ADAPTER_INTERFACE, "Powered", dbus.MakeVariant(enable)).Err
-}
-
-func (m *BluetoothManager) GetDeviceInfo(address string) (*utils.BluetoothDeviceInfo, error) {
+// SendPlayStateUpdate sends a play state update to the connected device
+func (m *ManagerV2) SendPlayStateUpdate(playState *PlayStateMessage) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	devicePath := formatDevicePath(m.adapter, address)
-	obj := m.conn.Object(BLUEZ_BUS_NAME, devicePath)
-
-	props := make(map[string]dbus.Variant)
-	if err := obj.Call("org.freedesktop.DBus.Properties.GetAll", 0, BLUEZ_DEVICE_INTERFACE).Store(&props); err != nil {
-		return nil, err
+	m.currentPlayState = playState
+	m.mu.Unlock()
+	
+	log.Printf("Sending play state update: %s - %s", playState.Artist, playState.TrackTitle)
+	
+	// Create the command
+	cmd := &Command{
+		Type:    MsgTypePlayStateUpdate,
+		Payload: EncodePlayStateUpdate(
+			playState.TrackTitle,
+			playState.Artist,
+			playState.Album,
+			playState.AlbumArtHash,
+			playState.Duration,
+			playState.Position,
+			playState.PlayState,
+		)[3:], // Remove the message header as it's added by sendCommand
+		ID:      fmt.Sprintf("playstate_%d", time.Now().UnixNano()),
 	}
-
-	info := &utils.BluetoothDeviceInfo{
-		Address: address,
-	}
-
-	if v, ok := props["Name"]; ok {
-		info.Name = v.Value().(string)
-	}
-	if v, ok := props["Alias"]; ok {
-		info.Alias = v.Value().(string)
-	}
-	if v, ok := props["Class"]; ok {
-		info.Class = fmt.Sprintf("%d", v.Value().(uint32))
-	}
-	if v, ok := props["Icon"]; ok {
-		info.Icon = v.Value().(string)
-	}
-	if v, ok := props["Paired"]; ok {
-		info.Paired = v.Value().(bool)
-	}
-	if v, ok := props["Trusted"]; ok {
-		info.Trusted = v.Value().(bool)
-	}
-	if v, ok := props["Blocked"]; ok {
-		info.Blocked = v.Value().(bool)
-	}
-	if v, ok := props["Connected"]; ok {
-		info.Connected = v.Value().(bool)
-	}
-	if v, ok := props["LegacyPairing"]; ok {
-		info.LegacyPairing = v.Value().(bool)
-	}
-
-	batteryProps := make(map[string]dbus.Variant)
-	if err := obj.Call("org.freedesktop.DBus.Properties.GetAll", 0, BLUEZ_BATTERY_INTERFACE).Store(&batteryProps); err == nil {
-		if v, ok := batteryProps["Percentage"]; ok {
-			info.BatteryPercentage = int(v.Value().(uint8))
-		}
-	}
-
-	return info, nil
-}
-
-func (m *BluetoothManager) RemoveDevice(address string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	devicePath := formatDevicePath(m.adapter, address)
-	obj := m.conn.Object(BLUEZ_BUS_NAME, m.adapter)
-
-	return obj.Call(BLUEZ_ADAPTER_INTERFACE+".RemoveDevice", 0, devicePath).Err
-}
-
-func (m *BluetoothManager) AcceptPairing() error {
-	return m.agent.AcceptPairing()
-}
-
-func (m *BluetoothManager) DenyPairing() error {
-	return m.agent.RejectPairing()
-}
-
-func (m *BluetoothManager) GetCurrentPairingRequest() *utils.PairingRequest {
-	if m.agent == nil {
-		return nil
-	}
-	return m.agent.current
-}
-
-func (m *BluetoothManager) ConnectNetwork(address string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	log.Printf("ConnectNetwork called for %s - NAP connections disabled", address)
-	return fmt.Errorf("network connections disabled - NAP profile not available")
-}
-
-func (m *BluetoothManager) GetDevices() ([]utils.BluetoothDeviceInfo, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var devices []utils.BluetoothDeviceInfo
-
-	objects := make(map[dbus.ObjectPath]map[string]map[string]dbus.Variant)
-	obj := m.conn.Object(BLUEZ_BUS_NAME, "/")
-	if err := obj.Call("org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&objects); err != nil {
-		return nil, fmt.Errorf("failed to get managed objects: %v", err)
-	}
-
-	for path, interfaces := range objects {
-		if deviceProps, ok := interfaces[BLUEZ_DEVICE_INTERFACE]; ok {
-			address := strings.TrimPrefix(string(path), string(m.adapter)+"/dev_")
-			address = strings.ReplaceAll(address, "_", ":")
-
-			deviceInfo := utils.BluetoothDeviceInfo{
-				Address: address,
-			}
-
-			if v, ok := deviceProps["Name"]; ok {
-				deviceInfo.Name = v.Value().(string)
-			}
-			if v, ok := deviceProps["Alias"]; ok {
-				deviceInfo.Alias = v.Value().(string)
-			}
-			if v, ok := deviceProps["Class"]; ok {
-				deviceInfo.Class = fmt.Sprintf("%d", v.Value().(uint32))
-			}
-			if v, ok := deviceProps["Icon"]; ok {
-				deviceInfo.Icon = v.Value().(string)
-			}
-			if v, ok := deviceProps["Paired"]; ok {
-				deviceInfo.Paired = v.Value().(bool)
-			}
-			if v, ok := deviceProps["Trusted"]; ok {
-				deviceInfo.Trusted = v.Value().(bool)
-			}
-			if v, ok := deviceProps["Blocked"]; ok {
-				deviceInfo.Blocked = v.Value().(bool)
-			}
-			if v, ok := deviceProps["Connected"]; ok {
-				deviceInfo.Connected = v.Value().(bool)
-			}
-			if v, ok := deviceProps["LegacyPairing"]; ok {
-				deviceInfo.LegacyPairing = v.Value().(bool)
-			}
-
-			if batteryProps, ok := interfaces[BLUEZ_BATTERY_INTERFACE]; ok {
-				if v, ok := batteryProps["Percentage"]; ok {
-					deviceInfo.BatteryPercentage = int(v.Value().(uint8))
-				}
-			}
-
-			devices = append(devices, deviceInfo)
-		}
-	}
-
-	return devices, nil
-}
-
-func (m *BluetoothManager) ConnectDevice(address string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	cmd := exec.Command("nmcli", "device", "connect", address)
-	_, err := cmd.CombinedOutput()
-
-	if err == nil {
-		log.Printf("Successfully connected to device %s", address)
-
-		go func() {
-			deviceInfo, err := m.GetDeviceInfo(address)
-			if err != nil {
-				log.Printf("Error getting device info after connect: %v", err)
-				if m.wsHub != nil {
-					m.wsHub.Broadcast(utils.WebSocketEvent{
-						Type: "bluetooth/connect",
-						Payload: utils.DeviceConnectedPayload{
-							Address: address,
-						},
-					})
-				}
-			} else {
-				if m.wsHub != nil {
-					m.wsHub.Broadcast(utils.WebSocketEvent{
-						Type: "bluetooth/connect",
-						Payload: utils.DeviceConnectedPayload{
-							Device: deviceInfo,
-						},
-					})
-				}
-			}
-		}()
-		return nil
-	}
-
-	return err
-}
-
-func (m *BluetoothManager) DisconnectDevice(address string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	devicePath := formatDevicePath(m.adapter, address)
-	obj := m.conn.Object(BLUEZ_BUS_NAME, devicePath)
-
-	m.pendingDisconnects.Store(address, true)
-
-	if err := obj.Call("org.bluez.Device1.Disconnect", 0).Err; err != nil {
-		m.pendingDisconnects.Delete(address)
-		return fmt.Errorf("failed to disconnect device: %v", err)
-	}
-
+	
+	m.client.sendCommand(cmd)
+	
+	// Broadcast via WebSocket
 	if m.wsHub != nil {
 		m.wsHub.Broadcast(utils.WebSocketEvent{
-			Type: "bluetooth/disconnect",
-			Payload: utils.DeviceDisconnectedPayload{
-				Address: address,
-			},
+			Type:    "media/play_state_update",
+			Payload: playState,
 		})
 	}
-
+	
 	return nil
 }
 
-func (m *BluetoothManager) GetBleClient() *BleClient {
-	return m.bleClient
+// SendVolumeUpdate sends a volume update to the connected device
+func (m *ManagerV2) SendVolumeUpdate(volume byte) error {
+	volumeMsg := &VolumeMessage{Volume: volume}
+	
+	m.mu.Lock()
+	m.currentVolume = volumeMsg
+	m.mu.Unlock()
+	
+	log.Printf("Sending volume update: %d%%", volume)
+	
+	cmd := &Command{
+		Type:    MsgTypeVolumeUpdate,
+		Payload: EncodeVolumeUpdate(volume)[3:], // Remove message header
+		ID:      fmt.Sprintf("volume_%d", time.Now().UnixNano()),
+	}
+	
+	m.client.sendCommand(cmd)
+	
+	// Broadcast via WebSocket
+	if m.wsHub != nil {
+		m.wsHub.Broadcast(utils.WebSocketEvent{
+			Type:    "media/volume_update",
+			Payload: volumeMsg,
+		})
+	}
+	
+	return nil
 }
 
-func (m *BluetoothManager) SendMediaCommand(command string, valueMs *int, valuePercent *int) error {
-	if m.bleClient != nil && m.bleClient.IsConnected() {
-		log.Printf("Sending media command via BLE: %s", command)
+// SendWeatherUpdate sends weather information to the connected device
+func (m *ManagerV2) SendWeatherUpdate(weather *WeatherMessage) error {
+	m.mu.Lock()
+	m.currentWeather = weather
+	m.mu.Unlock()
+	
+	log.Printf("Sending weather update: %s, %d°C", weather.Condition, weather.Temperature/10)
+	
+	// Encode weather data
+	payload := make([]byte, 0)
+	payload = append(payload, byte(weather.Temperature>>8))   // High byte
+	payload = append(payload, byte(weather.Temperature&0xFF)) // Low byte
+	payload = append(payload, weather.Humidity)
+	payload = append(payload, []byte(weather.Condition)...)
+	payload = append(payload, 0) // Null terminator
+	payload = append(payload, []byte(weather.Location)...)
+	payload = append(payload, 0) // Null terminator
+	
+	cmd := &Command{
+		Type:    MsgTypeWeatherUpdate,
+		Payload: payload,
+		ID:      fmt.Sprintf("weather_%d", time.Now().UnixNano()),
+	}
+	
+	m.client.sendCommand(cmd)
+	
+	// Broadcast via WebSocket
+	if m.wsHub != nil {
+		m.wsHub.Broadcast(utils.WebSocketEvent{
+			Type:    "weather/update",
+			Payload: weather,
+		})
+	}
+	
+	return nil
+}
 
-		isPlaying := false
-		switch command {
-		case "play":
-			isPlaying = true
-		case "pause":
-			isPlaying = false
+// SendAlbumArt sends album art data to the connected device
+func (m *ManagerV2) SendAlbumArt(hash string, data []byte) error {
+	log.Printf("Sending album art: %s (%d bytes)", hash, len(data))
+	
+	return m.albumArtHandler.SendAlbumArt(hash, data, func(msg []byte) error {
+		// Send via the album art TX characteristic
+		if m.client.albumArtTxChar != nil {
+			return m.client.albumArtTxChar.Call("org.bluez.GattCharacteristic1.WriteValue", 0, msg, map[string]interface{}{}).Store()
 		}
-		m.bleClient.UpdateLocalPlayState(&utils.MediaStateUpdate{IsPlaying: isPlaying})
+		return fmt.Errorf("album art characteristic not available")
+	})
+}
 
-		m.bleClient.sendCommand(&Command{Type: 0x01, Payload: []byte(command)})
-		return nil
+// GetCurrentState returns the current state of the system
+func (m *ManagerV2) GetCurrentState() map[string]interface{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	state := map[string]interface{}{
+		"connection_status": m.connectionStatus,
+		"is_running":        m.isRunning,
 	}
-
-	return fmt.Errorf("BLE client not connected")
-}
-
-func (m *BluetoothManager) RequestAlbumArt(trackID string, checksum string) error {
-	if m.bleClient != nil && m.bleClient.IsConnected() {
-		log.Printf("Requesting album art for track: %s", trackID)
-		return fmt.Errorf("not implemented")
+	
+	if m.currentPlayState != nil {
+		state["play_state"] = m.currentPlayState
 	}
-	return fmt.Errorf("BLE client not connected")
+	
+	if m.currentVolume != nil {
+		state["volume"] = m.currentVolume
+	}
+	
+	if m.currentWeather != nil {
+		state["weather"] = m.currentWeather
+	}
+	
+	if m.currentDeviceInfo != nil {
+		state["device_info"] = m.currentDeviceInfo
+	}
+	
+	return state
 }
 
-func (m *BluetoothManager) UpdateLocalVolume(volumePercent int) {
-	if m.bleClient != nil {
-		// m.bleClient.UpdateLocalVolume(volumePercent)
+// GetAlbumArtHandler returns the album art handler
+func (m *ManagerV2) GetAlbumArtHandler() *AlbumArtHandler {
+	return m.albumArtHandler
+}
+
+// GetBleClient returns the BLE client
+func (m *ManagerV2) GetBleClient() *BleClientV2 {
+	return m.client
+}
+
+// SetPlayStateCallback sets the callback for play state updates
+func (m *ManagerV2) SetPlayStateCallback(callback func(*PlayStateMessage)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.playStateCallback = callback
+}
+
+// SetVolumeCallback sets the callback for volume updates
+func (m *ManagerV2) SetVolumeCallback(callback func(*VolumeMessage)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.volumeCallback = callback
+}
+
+// SetWeatherCallback sets the callback for weather updates
+func (m *ManagerV2) SetWeatherCallback(callback func(*WeatherMessage)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.weatherCallback = callback
+}
+
+// UpdateRateLimitConfig updates the rate limiting configuration
+func (m *ManagerV2) UpdateRateLimitConfig(config *RateLimitConfig) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	if config != nil {
+		m.rateLimitConfig = config
+		log.Printf("Updated rate limit config: %d cmd/s, burst: %d", 
+			config.MaxCommandsPerSecond, config.BurstSize)
 	}
 }
 
-func (m *BluetoothManager) GetMediaState() *utils.MediaStateUpdate {
-	if m.bleClient != nil && m.bleClient.IsConnected() {
-		return m.bleClient.GetCurrentState()
-	}
-
-	return nil
-}
-
-func (m *BluetoothManager) IsMediaConnected() bool {
-	return m.bleClient != nil && m.bleClient.IsConnected()
-}
-
-func (m *BluetoothManager) GetConnectionStatus() map[string]bool {
-	return map[string]bool{
-		"ble_connected": m.bleClient != nil && m.bleClient.IsConnected(),
+// monitorConnection monitors the BLE connection status
+func (m *ManagerV2) monitorConnection() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-m.stopChan:
+			return
+		case <-ticker.C:
+			m.checkConnectionStatus()
+		}
 	}
 }
 
-func (m *BluetoothManager) GetProfileManager() *ProfileManager {
-	return m.profileManager
+// checkConnectionStatus checks and updates the connection status
+func (m *ManagerV2) checkConnectionStatus() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	wasConnected := m.connectionStatus.Status == ConnectionStateConnected
+	isConnected := m.client.isConnected
+	
+	now := uint64(time.Now().Unix())
+	
+	if isConnected && !wasConnected {
+		// Connection established
+		m.connectionStatus.Status = ConnectionStateConnected
+		m.connectionStatus.LastSeen = now
+		m.connectionStatus.ErrorMessage = ""
+		
+		log.Println("BT_MGR: BLE connection established successfully")
+		
+		if m.wsHub != nil {
+			m.wsHub.Broadcast(utils.WebSocketEvent{
+				Type: "bluetooth/connected",
+				Payload: map[string]interface{}{
+					"timestamp": now,
+				},
+			})
+		}
+	} else if !isConnected && wasConnected {
+		// Connection lost
+		m.connectionStatus.Status = ConnectionStateDisconnected
+		m.connectionStatus.ErrorMessage = "Connection lost"
+		
+		log.Println("BT_MGR: BLE connection lost, attempting to reconnect...")
+		
+		if m.wsHub != nil {
+			m.wsHub.Broadcast(utils.WebSocketEvent{
+				Type: "bluetooth/disconnected",
+				Payload: map[string]interface{}{
+					"timestamp": now,
+				},
+			})
+		}
+	} else if isConnected {
+		// Update last seen time (only log periodically to avoid spam)
+		m.connectionStatus.LastSeen = now
+	}
+}
+
+// cleanupRoutine performs periodic cleanup tasks
+func (m *ManagerV2) cleanupRoutine() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-m.stopChan:
+			return
+		case <-ticker.C:
+			// Clean up stale album art transfers
+			m.albumArtHandler.CleanupStaleTransfers(5 * time.Minute)
+		}
+	}
+}
+
+// GetStats returns system statistics
+func (m *ManagerV2) GetStats() map[string]interface{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	cacheEntries, cacheSize := m.albumArtHandler.GetCacheStats()
+	activeTransfers := len(m.albumArtHandler.GetActiveTransfers())
+	
+	return map[string]interface{}{
+		"is_running":        m.isRunning,
+		"connection_status": m.connectionStatus,
+		"album_art_cache": map[string]interface{}{
+			"entries":          cacheEntries,
+			"total_size_bytes": cacheSize,
+		},
+		"album_art_transfers": map[string]interface{}{
+			"active": activeTransfers,
+		},
+		"rate_limiting": map[string]interface{}{
+			"max_commands_per_second": m.rateLimitConfig.MaxCommandsPerSecond,
+			"burst_size":              m.rateLimitConfig.BurstSize,
+			"chunk_delay_ms":          m.rateLimitConfig.ChunkDelay.Milliseconds(),
+		},
+	}
 }
