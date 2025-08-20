@@ -1,11 +1,13 @@
 package utils
 
 import (
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -53,6 +55,21 @@ func GetAlbumArtPath(checksum string) string {
 
 func GenerateAlbumArtHash(data []byte) string {
 	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
+}
+
+// GenerateMetadataHash is DEPRECATED - album art now uses integer hashes from companion
+// This function is kept for potential non-album-art use cases but should not be used for album art
+func GenerateMetadataHash(artist, album string) string {
+	// Normalize strings: lowercase, trim spaces (matching Android)
+	normalizedArtist := strings.ToLower(strings.TrimSpace(artist))
+	normalizedAlbum := strings.ToLower(strings.TrimSpace(album))
+	
+	// Combine artist and album with hyphen (matching Android)
+	combined := fmt.Sprintf("%s-%s", normalizedArtist, normalizedAlbum)
+	
+	// Generate MD5 hash
+	hash := md5.Sum([]byte(combined))
 	return hex.EncodeToString(hash[:])
 }
 

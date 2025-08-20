@@ -1,12 +1,27 @@
 package bluetooth
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/md5"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
 )
+
+// AlbumArtTransferStats contains statistics about a completed transfer
+type AlbumArtTransferStats struct {
+	Hash         string
+	Size         int
+	Chunks       int
+	Duration     time.Duration
+	SpeedKBps    float64
+	SpeedMbps    float64
+	StartTime    time.Time
+	EndTime      time.Time
+}
 
 // AlbumArtHandler manages album art transfers for the v2 protocol
 type AlbumArtHandler struct {
@@ -15,7 +30,9 @@ type AlbumArtHandler struct {
 	cache           map[string][]byte // Hash -> image data cache
 	maxCacheSize    int
 	chunkSize       int
-	callback        func([]byte) // Callback when album art is received
+	callback        func([]byte, *AlbumArtTransferStats) // Callback when album art is received
+	saveCallback    func(string, []byte) error // Callback to save album art to file (hash, data)
+	enabled         bool // Whether album art transfers are enabled
 }
 
 // NewAlbumArtHandler creates a new album art handler
@@ -25,14 +42,41 @@ func NewAlbumArtHandler() *AlbumArtHandler {
 		cache:           make(map[string][]byte),
 		maxCacheSize:    50, // Cache up to 50 album arts
 		chunkSize:       DefaultChunkSize,
+		enabled:         true, // Enabled by default for backwards compatibility
 	}
 }
 
 // SetCallback sets the callback function for when album art is received
-func (h *AlbumArtHandler) SetCallback(callback func([]byte)) {
+func (h *AlbumArtHandler) SetCallback(callback func([]byte, *AlbumArtTransferStats)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.callback = callback
+}
+
+// SetSaveCallback sets the callback function to save album art to file
+func (h *AlbumArtHandler) SetSaveCallback(saveCallback func(string, []byte) error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.saveCallback = saveCallback
+}
+
+// SetEnabled enables or disables album art transfers
+func (h *AlbumArtHandler) SetEnabled(enabled bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.enabled = enabled
+	if !enabled {
+		log.Println("Album art transfers disabled - will ignore incoming transfers")
+	} else {
+		log.Println("Album art transfers enabled")
+	}
+}
+
+// IsEnabled returns whether album art transfers are enabled
+func (h *AlbumArtHandler) IsEnabled() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.enabled
 }
 
 // SetChunkSize sets the chunk size for album art transfers
@@ -87,8 +131,19 @@ func (h *AlbumArtHandler) StoreInCache(hash string, data []byte) {
 
 // StartTransfer starts an album art transfer
 func (h *AlbumArtHandler) StartTransfer(hash string, totalChunks int, totalSize int) error {
+	return h.StartTransferWithCompression(hash, totalChunks, totalSize, 0, false)
+}
+
+// StartTransferWithCompression starts an album art transfer with compression support
+func (h *AlbumArtHandler) StartTransferWithCompression(hash string, totalChunks int, totalSize int, compressedSize int, isGzipCompressed bool) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	
+	// Check if album art transfers are enabled
+	if !h.enabled {
+		log.Printf("Album art transfers disabled - ignoring transfer for %s", hash[:16]+"...")
+		return nil
+	}
 	
 	// Check if we already have this album art in cache
 	if _, exists := h.cache[hash]; exists {
@@ -105,18 +160,35 @@ func (h *AlbumArtHandler) StartTransfer(hash string, totalChunks int, totalSize 
 	}
 	
 	transfer := &AlbumArtTransfer{
-		Hash:        hash,
-		Chunks:      make(map[int][]byte),
-		TotalChunks: totalChunks,
-		Size:        totalSize,
-		StartTime:   time.Now(),
-		LastUpdate:  time.Now(),
-		IsReceiving: true,
-		IsComplete:  false,
+		Hash:             hash,
+		Chunks:           make(map[int][]byte),
+		TotalChunks:      totalChunks,
+		Size:             totalSize,
+		CompressedSize:   compressedSize,
+		IsGzipCompressed: isGzipCompressed,
+		StartTime:        time.Now(),
+		LastUpdate:       time.Now(),
+		IsReceiving:      true,
+		IsComplete:       false,
 	}
 	
 	h.activeTransfers[hash] = transfer
-	log.Printf("Started album art transfer for %s: %d chunks, %d bytes", hash, totalChunks, totalSize)
+	log.Printf("🎨 ═══════════════════════════════════════════════════════════════")
+	log.Printf("🎨 ALBUM ART TRANSFER STARTED")
+	log.Printf("🎨 ═══════════════════════════════════════════════════════════════")
+	log.Printf("🎨 Hash: %s", hash[:16]+"...")
+	log.Printf("🎨 Expected Size: %d bytes (%.2f KB)", totalSize, float64(totalSize)/1024.0)
+	if isGzipCompressed && compressedSize > 0 {
+		compressionRatio := float64(totalSize) / float64(compressedSize)
+		log.Printf("🎨 Compressed Size: %d bytes (%.2f KB)", compressedSize, float64(compressedSize)/1024.0)
+		log.Printf("🎨 Compression Ratio: %.2fx", compressionRatio)
+		log.Printf("🎨 Compression: GZIP")
+	} else {
+		log.Printf("🎨 Compression: None")
+	}
+	log.Printf("🎨 Expected Chunks: %d", totalChunks)
+	log.Printf("🎨 Start Time: %s", transfer.StartTime.Format("15:04:05.000"))
+	log.Printf("🎨 ═══════════════════════════════════════════════════════════════")
 	
 	return nil
 }
@@ -125,6 +197,12 @@ func (h *AlbumArtHandler) StartTransfer(hash string, totalChunks int, totalSize 
 func (h *AlbumArtHandler) ReceiveChunk(hash string, chunkIndex int, chunkData []byte) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	
+	// Check if album art transfers are enabled
+	if !h.enabled {
+		log.Printf("Album art transfers disabled - ignoring chunk for %s", hash[:16]+"...")
+		return nil
+	}
 	
 	transfer, exists := h.activeTransfers[hash]
 	if !exists {
@@ -166,10 +244,24 @@ func (h *AlbumArtHandler) completeTransfer(hash string) error {
 		totalSize += len(chunk)
 	}
 	
-	// Create the complete data
-	completeData := make([]byte, 0, totalSize)
+	// Create the complete data (this is still compressed if compression was used)
+	compressedData := make([]byte, 0, totalSize)
 	for i := 0; i < transfer.TotalChunks; i++ {
-		completeData = append(completeData, transfer.Chunks[i]...)
+		compressedData = append(compressedData, transfer.Chunks[i]...)
+	}
+	
+	// Decompress if needed
+	var completeData []byte
+	var err error
+	if transfer.IsGzipCompressed {
+		log.Printf("🎨 Decompressing GZIP data (%d bytes -> expected %d bytes)", len(compressedData), transfer.Size)
+		completeData, err = h.decompressGzip(compressedData)
+		if err != nil {
+			return fmt.Errorf("failed to decompress GZIP data: %w", err)
+		}
+		log.Printf("🎨 Decompression complete: %d bytes -> %d bytes", len(compressedData), len(completeData))
+	} else {
+		completeData = compressedData
 	}
 	
 	// Verify hash
@@ -184,16 +276,44 @@ func (h *AlbumArtHandler) completeTransfer(hash string) error {
 	transfer.IsComplete = true
 	
 	duration := time.Since(transfer.StartTime)
-	log.Printf("Completed album art transfer for %s: %d bytes in %v (%.2f KB/s)", 
-		hash, len(completeData), duration, float64(len(completeData))/1024.0/duration.Seconds())
+	speedKBps := float64(len(completeData)) / 1024.0 / duration.Seconds()
+	speedMbps := (float64(len(completeData)) * 8) / (1024.0 * 1024.0) / duration.Seconds()
+	
+	log.Printf("🎨 ═══════════════════════════════════════════════════════════════")
+	log.Printf("🎨 ALBUM ART TRANSFER COMPLETED")
+	log.Printf("🎨 ═══════════════════════════════════════════════════════════════")
+	log.Printf("🎨 Hash: %s", hash[:16]+"...")
+	log.Printf("🎨 Size: %d bytes (%.2f KB)", len(completeData), float64(len(completeData))/1024.0)
+	log.Printf("🎨 Chunks: %d", transfer.TotalChunks)
+	log.Printf("🎨 Duration: %v", duration)
+	log.Printf("🎨 Speed: %.2f KB/s (%.2f Mbps)", speedKBps, speedMbps)
+	log.Printf("🎨 ═══════════════════════════════════════════════════════════════")
 	
 	// Store in cache
 	h.cache[hash] = make([]byte, len(completeData))
 	copy(h.cache[hash], completeData)
 	
+	// Save to file if callback is set
+	if h.saveCallback != nil {
+		if err := h.saveCallback(hash, completeData); err != nil {
+			log.Printf("Failed to save album art to file: %v", err)
+		}
+	}
+	
 	// Call callback if set
 	if h.callback != nil {
-		go h.callback(completeData)
+		endTime := time.Now()
+		stats := &AlbumArtTransferStats{
+			Hash:      hash,
+			Size:      len(completeData),
+			Chunks:    transfer.TotalChunks,
+			Duration:  duration,
+			SpeedKBps: speedKBps,
+			SpeedMbps: speedMbps,
+			StartTime: transfer.StartTime,
+			EndTime:   endTime,
+		}
+		h.callback(completeData, stats)
 	}
 	
 	// Clean up transfer
@@ -322,4 +442,20 @@ func (h *AlbumArtHandler) GetTransferProgress(hash string) (received int, total 
 	}
 	
 	return len(transfer.Chunks), transfer.TotalChunks, true
+}
+
+// decompressGzip decompresses GZIP-compressed data
+func (h *AlbumArtHandler) decompressGzip(compressedData []byte) ([]byte, error) {
+	reader, err := gzip.NewReader(bytes.NewReader(compressedData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GZIP reader: %w", err)
+	}
+	defer reader.Close()
+	
+	decompressedData, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read decompressed data: %w", err)
+	}
+	
+	return decompressedData, nil
 }

@@ -3,6 +3,8 @@ package bluetooth
 import (
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -26,10 +28,14 @@ type ManagerV2 struct {
 	currentWeather      *WeatherMessage
 	currentDeviceInfo   *DeviceInfoMessage
 	connectionStatus    *ConnectionStatusMessage
+	currentMediaState   *MediaState
 	
 	// Configuration
 	rateLimitConfig *RateLimitConfig
 	chunkSize       int
+	
+	// Activity tracking for health checks
+	lastActivity    time.Time
 	
 	// Callbacks
 	playStateCallback func(*PlayStateMessage)
@@ -50,6 +56,7 @@ func NewManagerV2(wsHub *utils.WebSocketHub) (*ManagerV2, error) {
 		stopChan:        make(chan struct{}),
 		rateLimitConfig: DefaultRateLimitConfig(),
 		chunkSize:       DefaultChunkSize,
+		lastActivity:    time.Now(),
 		connectionStatus: &ConnectionStatusMessage{
 			Status:   ConnectionStateDisconnected,
 			LastSeen: 0,
@@ -58,24 +65,46 @@ func NewManagerV2(wsHub *utils.WebSocketHub) (*ManagerV2, error) {
 	
 	// Initialize album art handler
 	manager.albumArtHandler = NewAlbumArtHandler()
-	manager.albumArtHandler.SetCallback(func(data []byte) {
+	manager.albumArtHandler.SetCallback(func(data []byte, stats *AlbumArtTransferStats) {
+		// Record activity for health check timing
+		manager.recordActivity()
+		
 		// Store album art in the utils package for other components
 		utils.SetCurrentAlbumArt(data)
 		
-		// Broadcast via WebSocket
+		// Broadcast via WebSocket with detailed transfer stats
 		if manager.wsHub != nil {
 			manager.wsHub.Broadcast(utils.WebSocketEvent{
 				Type: "media/album_art_received",
 				Payload: map[string]interface{}{
-					"size":      len(data),
-					"timestamp": time.Now().Unix(),
+					"size":         stats.Size,
+					"size_kb":      float64(stats.Size) / 1024.0,
+					"chunks":       stats.Chunks,
+					"duration_ms":  stats.Duration.Milliseconds(),
+					"duration_str": stats.Duration.String(),
+					"speed_kbps":   stats.SpeedKBps,
+					"speed_mbps":   stats.SpeedMbps,
+					"hash":         stats.Hash[:16] + "...",
+					"timestamp":    time.Now().Unix(),
+					"start_time":   stats.StartTime.Unix(),
+					"end_time":     stats.EndTime.Unix(),
 				},
 			})
 		}
+		
+		// Also broadcast that album art is now available at the endpoint
+		manager.broadcastAlbumArtAvailable(stats.Hash)
 	})
+	
+	// Set save callback to save album art to file
+	manager.albumArtHandler.SetSaveCallback(manager.saveAlbumArtToFile)
 	
 	// Initialize BLE client
 	manager.client = NewBleClientV2(conn, wsHub)
+	manager.client.albumArtHandler = manager.albumArtHandler
+	
+	// Set media state callback
+	manager.client.SetMediaStateCallback(manager.UpdateMediaState)
 	
 	return manager, nil
 }
@@ -273,7 +302,164 @@ func (m *ManagerV2) GetCurrentState() map[string]interface{} {
 		state["device_info"] = m.currentDeviceInfo
 	}
 	
+	if m.currentMediaState != nil {
+		state["media_state"] = m.currentMediaState
+	}
+	
 	return state
+}
+
+// UpdateMediaState updates the current media state from FullState messages
+func (m *ManagerV2) UpdateMediaState(mediaState *MediaState) {
+	// Record activity for health check timing
+	m.recordActivity()
+	
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	// Check if this is a new album (different album_hash)
+	var needsAlbumArt bool
+	if m.currentMediaState == nil || m.currentMediaState.AlbumHash != mediaState.AlbumHash {
+		needsAlbumArt = true
+	}
+	
+	m.currentMediaState = mediaState
+	log.Printf("🎵 Updated media state: %s - %s (%s) [hash: %d]", mediaState.Artist, mediaState.Track, mediaState.Album, mediaState.AlbumHash)
+	
+	// Check for album art if this is a new album - skip hash validation and use hash directly
+	if needsAlbumArt && mediaState.AlbumHash != 0 {
+		go m.checkAndRequestAlbumArtByHash(mediaState.AlbumHash)
+	}
+	
+	// Broadcast the updated media state to WebSocket clients immediately
+	if m.wsHub != nil {
+		m.wsHub.Broadcast(utils.WebSocketEvent{
+			Type: "media/state_update",
+			Payload: map[string]interface{}{
+				"artist":         mediaState.Artist,
+				"album":          mediaState.Album,
+				"track":          mediaState.Track,
+				"duration_ms":    mediaState.DurationMs,
+				"position_ms":    mediaState.PositionMs,
+				"is_playing":     mediaState.IsPlaying,
+				"volume_percent": mediaState.Volume,
+				"album_hash":     mediaState.AlbumHash,
+				"last_update":    mediaState.LastUpdate.Unix(),
+			},
+		})
+		log.Printf("🎵 Broadcasted media state update via WebSocket")
+	}
+}
+
+// GetCurrentMediaState returns the current media state
+func (m *ManagerV2) GetCurrentMediaState() *MediaState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	return m.currentMediaState
+}
+
+// SendMediaCommand sends media control commands to the companion device
+func (m *ManagerV2) SendMediaCommand(command string, params map[string]interface{}) error {
+	// Record activity for health check timing
+	m.recordActivity()
+	
+	if m.client == nil {
+		return fmt.Errorf("BLE client not initialized")
+	}
+	
+	// Optimistically update the stored state immediately for better UI responsiveness
+	m.mu.Lock()
+	if m.currentMediaState != nil {
+		// Create a copy of the current state to modify
+		updatedState := *m.currentMediaState
+		updatedState.LastUpdate = time.Now()
+		
+		switch command {
+		case "play":
+			updatedState.IsPlaying = true
+			m.currentMediaState = &updatedState
+		case "pause":
+			updatedState.IsPlaying = false
+			m.currentMediaState = &updatedState
+		case "volume":
+			if vol, ok := params["volume"].(int); ok {
+				updatedState.Volume = vol
+				m.currentMediaState = &updatedState
+			}
+		case "seek":
+			if pos, ok := params["position"].(int64); ok {
+				updatedState.PositionMs = pos
+				m.currentMediaState = &updatedState
+			}
+		// Note: next/previous don't update state optimistically since we don't know the new track
+		}
+		
+		// Broadcast the optimistic update to WebSocket clients immediately
+		if m.wsHub != nil {
+			m.wsHub.Broadcast(utils.WebSocketEvent{
+				Type: "media/state_update",
+				Payload: map[string]interface{}{
+					"artist":         m.currentMediaState.Artist,
+					"album":          m.currentMediaState.Album,
+					"track":          m.currentMediaState.Track,
+					"duration_ms":    m.currentMediaState.DurationMs,
+					"position_ms":    m.currentMediaState.PositionMs,
+					"is_playing":     m.currentMediaState.IsPlaying,
+					"volume_percent": m.currentMediaState.Volume,
+					"optimistic":     true, // Flag to indicate this is an optimistic update
+				},
+			})
+		}
+	}
+	m.mu.Unlock()
+	
+	// Send the command to the companion device
+	var err error
+	switch command {
+	case "play":
+		err = m.client.SendPlayCommand()
+		if err == nil {
+			log.Printf("🎵 Sent play command, optimistically updated state")
+		}
+	case "pause":
+		err = m.client.SendPauseCommand()
+		if err == nil {
+			log.Printf("🎵 Sent pause command, optimistically updated state")
+		}
+	case "next":
+		err = m.client.SendNextCommand()
+		if err == nil {
+			log.Printf("🎵 Sent next command")
+		}
+	case "previous":
+		err = m.client.SendPreviousCommand()
+		if err == nil {
+			log.Printf("🎵 Sent previous command")
+		}
+	case "volume":
+		if vol, ok := params["volume"].(int); ok {
+			err = m.client.SendVolumeCommand(vol)
+			if err == nil {
+				log.Printf("🎵 Sent volume command: %d%%, optimistically updated state", vol)
+			}
+		} else {
+			return fmt.Errorf("invalid volume parameter")
+		}
+	case "seek":
+		if pos, ok := params["position"].(int64); ok {
+			err = m.client.SendSeekCommand(pos)
+			if err == nil {
+				log.Printf("🎵 Sent seek command: %dms, optimistically updated state", pos)
+			}
+		} else {
+			return fmt.Errorf("invalid seek position parameter")
+		}
+	default:
+		return fmt.Errorf("unknown command: %s", command)
+	}
+	
+	return err
 }
 
 // GetAlbumArtHandler returns the album art handler
@@ -307,6 +493,21 @@ func (m *ManagerV2) SetWeatherCallback(callback func(*WeatherMessage)) {
 	m.weatherCallback = callback
 }
 
+// SetAlbumArtEnabled enables or disables album art transfers
+func (m *ManagerV2) SetAlbumArtEnabled(enabled bool) {
+	if m.albumArtHandler != nil {
+		m.albumArtHandler.SetEnabled(enabled)
+	}
+}
+
+// IsAlbumArtEnabled returns whether album art transfers are enabled
+func (m *ManagerV2) IsAlbumArtEnabled() bool {
+	if m.albumArtHandler != nil {
+		return m.albumArtHandler.IsEnabled()
+	}
+	return false
+}
+
 // UpdateRateLimitConfig updates the rate limiting configuration
 func (m *ManagerV2) UpdateRateLimitConfig(config *RateLimitConfig) {
 	m.mu.Lock()
@@ -319,9 +520,16 @@ func (m *ManagerV2) UpdateRateLimitConfig(config *RateLimitConfig) {
 	}
 }
 
+// recordActivity records the current time as the last activity
+func (m *ManagerV2) recordActivity() {
+	m.mu.Lock()
+	m.lastActivity = time.Now()
+	m.mu.Unlock()
+}
+
 // monitorConnection monitors the BLE connection status
 func (m *ManagerV2) monitorConnection() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	
 	for {
@@ -329,7 +537,14 @@ func (m *ManagerV2) monitorConnection() {
 		case <-m.stopChan:
 			return
 		case <-ticker.C:
-			m.checkConnectionStatus()
+			// Only check connection health if we've been idle for 30+ seconds
+			m.mu.RLock()
+			timeSinceActivity := time.Since(m.lastActivity)
+			m.mu.RUnlock()
+			
+			if timeSinceActivity >= 30*time.Second {
+				m.checkConnectionStatus()
+			}
 		}
 	}
 }
@@ -420,5 +635,119 @@ func (m *ManagerV2) GetStats() map[string]interface{} {
 			"burst_size":              m.rateLimitConfig.BurstSize,
 			"chunk_delay_ms":          m.rateLimitConfig.ChunkDelay.Milliseconds(),
 		},
+	}
+}
+
+// checkAndRequestAlbumArtByHash checks if album art exists using the hash from full state update and requests it if missing
+func (m *ManagerV2) checkAndRequestAlbumArtByHash(albumHash int32) {
+	// Convert hash to string for file operations
+	hashStr := fmt.Sprintf("%d", albumHash)
+	
+	log.Printf("🎨 Checking album art for hash %s (skipping hash validation as requested)", hashStr)
+	
+	// First check if it's already in the album art handler's memory cache
+	if _, exists := m.albumArtHandler.GetFromCache(hashStr); exists {
+		log.Printf("🎨 Album art for hash %s already in memory cache", hashStr)
+		return
+	}
+	
+	// Check if album art file exists in /var/album_art/
+	albumArtDir := "/var/album_art"
+	albumArtPath := filepath.Join(albumArtDir, fmt.Sprintf("%s.webp", hashStr))
+	
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(albumArtDir, 0755); err != nil {
+		log.Printf("🎨 Failed to create album art directory: %v", err)
+		return
+	}
+	
+	// Check if file exists
+	if _, err := os.Stat(albumArtPath); err == nil {
+		log.Printf("🎨 Album art file exists at %s, loading into cache", albumArtPath)
+		// Load from file into cache
+		if data, err := os.ReadFile(albumArtPath); err == nil {
+			m.albumArtHandler.StoreInCache(hashStr, data)
+			log.Printf("🎨 Loaded album art from file into cache: %d bytes", len(data))
+			// Set as current album art for global access
+			utils.SetCurrentAlbumArt(data)
+			// Broadcast that album art is available
+			m.broadcastAlbumArtAvailable(hashStr)
+			return
+		} else {
+			log.Printf("🎨 Failed to read album art file %s: %v", albumArtPath, err)
+		}
+	} else {
+		log.Printf("🎨 Album art file not found at %s", albumArtPath)
+	}
+	
+	// Album art not found, request it from the companion device using the hash
+	log.Printf("🎨 Requesting album art for hash %s from companion device", hashStr)
+	if err := m.requestAlbumArtFromCompanion(hashStr); err != nil {
+		log.Printf("🎨 Failed to request album art: %v", err)
+	}
+}
+
+// checkAndRequestAlbumArt is DEPRECATED - use checkAndRequestAlbumArtByHash instead
+// This method used SHA-256 metadata hashes which caused inconsistencies
+func (m *ManagerV2) checkAndRequestAlbumArt(albumHash int32, album, artist string) {
+	log.Printf("🚫 DEPRECATED: checkAndRequestAlbumArt called - using checkAndRequestAlbumArtByHash instead")
+	// Forward to the new integer hash method
+	m.checkAndRequestAlbumArtByHash(albumHash)
+}
+
+// requestAlbumArtFromCompanion sends an album art query to the companion device
+func (m *ManagerV2) requestAlbumArtFromCompanion(hashStr string) error {
+	if m.client == nil {
+		return fmt.Errorf("BLE client not initialized")
+	}
+	
+	// Create album art query command using Binary Protocol V2
+	queryPayload := CreateStringPayload(hashStr) // Album art query payload is just the hash string
+	message := EncodeMessage(MSG_CMD_ALBUM_ART_QUERY, queryPayload, 0)
+	
+	// Send via command characteristic
+	if m.client.commandRxChar != nil {
+		log.Printf("🎨 Sending album art query for hash %s", hashStr)
+		return m.client.commandRxChar.Call("org.bluez.GattCharacteristic1.WriteValue", 0, message, map[string]interface{}{}).Store()
+	}
+	
+	return fmt.Errorf("command characteristic not available")
+}
+
+// saveAlbumArtToFile saves album art data to the /var/album_art directory
+func (m *ManagerV2) saveAlbumArtToFile(hashStr string, data []byte) error {
+	albumArtDir := "/var/album_art"
+	albumArtPath := filepath.Join(albumArtDir, fmt.Sprintf("%s.webp", hashStr))
+	
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(albumArtDir, 0755); err != nil {
+		return fmt.Errorf("failed to create album art directory: %w", err)
+	}
+	
+	// Write file
+	if err := os.WriteFile(albumArtPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write album art file: %w", err)
+	}
+	
+	log.Printf("🎨 Saved album art to %s (%d bytes)", albumArtPath, len(data))
+	
+	// Note: SetCurrentAlbumArt and broadcastAlbumArtAvailable are handled 
+	// by the album art handler callback to avoid duplication
+	
+	return nil
+}
+
+// broadcastAlbumArtAvailable broadcasts a WebSocket event that new album art is available
+func (m *ManagerV2) broadcastAlbumArtAvailable(hashStr string) {
+	if m.wsHub != nil {
+		m.wsHub.Broadcast(utils.WebSocketEvent{
+			Type: "media/album_art_available",
+			Payload: map[string]interface{}{
+				"hash":      hashStr,
+				"endpoint":  fmt.Sprintf("/api/v2/album-art/current"),
+				"timestamp": time.Now().Unix(),
+			},
+		})
+		log.Printf("🎨 Broadcasted album art available event for hash %s", hashStr)
 	}
 }

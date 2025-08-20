@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"log"
+	"time"
 )
 
 // BinaryProtocolV2 constants compatible with NocturneCompanion
@@ -47,10 +49,12 @@ const (
 	MSG_STATE_ARTIST_ALBUM = 0x0209
 
 	// Album art messages (0x03xx)
-	MSG_ALBUM_ART_START        = 0x0301
-	MSG_ALBUM_ART_CHUNK        = 0x0302
-	MSG_ALBUM_ART_END          = 0x0303
-	MSG_ALBUM_ART_NOT_AVAILABLE = 0x0304
+	MSG_ALBUM_ART_START           = 0x0301
+	MSG_ALBUM_ART_CHUNK           = 0x0302
+	MSG_ALBUM_ART_END             = 0x0303
+	MSG_ALBUM_ART_NOT_AVAILABLE   = 0x0304
+	MSG_ALBUM_ART_AVAILABLE_QUERY = 0x0305  // Ask if art is needed
+	MSG_ALBUM_ART_NEEDED_RESPONSE = 0x0306  // Response: y/n
 
 	// Test album art messages (0x031x)
 	MSG_TEST_ALBUM_ART_START = 0x0310
@@ -132,10 +136,32 @@ func DecodeMessage(data []byte) (messageType uint16, payload []byte, messageID u
 	// Extract protocol version and message type
 	version := (versionedType >> 12) & 0x0F
 	messageType = versionedType & 0x0FFF
+	
+	// Debug: Log raw header bytes for problematic messages
+	if version != PROTOCOL_VERSION || messageType == 0x0b22 {
+		log.Printf("🔍 DEBUG: Raw message header analysis")
+		log.Printf("🔍 Total bytes received: %d", len(data))
+		log.Printf("🔍 Header bytes (16): %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", 
+			data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+			data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15])
+		log.Printf("🔍 Parsed: versionedType=0x%04x, messageID=%d, payloadSize=%d, headerCRC32=0x%08x", 
+			versionedType, messageID, payloadSize, headerCRC32)
+		log.Printf("🔍 Extracted: version=%d, messageType=0x%04x", version, messageType)
+	}
 
-	// Verify protocol version
-	if version != PROTOCOL_VERSION {
+	// Check if this is an album art related message (0x03xx range or 0x0109 command)
+	isAlbumArtMessage := (messageType >= 0x0301 && messageType <= 0x031F) || messageType == MSG_CMD_ALBUM_ART_QUERY
+
+	// Verify protocol version (skip for album art messages to allow compatibility)
+	if !isAlbumArtMessage && version != PROTOCOL_VERSION {
+		log.Printf("❌ Protocol version mismatch: message type 0x%04x (%s) has version %d (expected %d)", 
+			messageType, GetMessageTypeString(messageType), version, PROTOCOL_VERSION)
 		return 0, nil, 0, fmt.Errorf("unsupported protocol version: %d", version)
+	}
+
+	// For album art messages, log version mismatch but continue
+	if isAlbumArtMessage && version != PROTOCOL_VERSION {
+		log.Printf("🎨 Album art related message (type 0x%04x) with protocol version %d (expected %d), continuing anyway", messageType, version, PROTOCOL_VERSION)
 	}
 
 	// Check payload size
@@ -298,12 +324,14 @@ func CreateArtistAlbumPayload(artist, album string) []byte {
 
 // Album art payload structures compatible with NocturneCompanion
 
-// AlbumArtStartPayload represents album art start message with SHA-256 checksum
+// AlbumArtStartPayload represents album art start message with SHA-256 checksum and compression support
 type AlbumArtStartPayload struct {
-	Checksum    [32]byte // SHA-256 checksum
-	TotalChunks uint32   // Total number of chunks
-	ImageSize   uint32   // Total image size
-	TrackID     string   // Track identifier
+	Checksum         [32]byte // SHA-256 checksum
+	TotalChunks      uint32   // Total number of chunks
+	ImageSize        uint32   // Original image size
+	TrackID          string   // Track identifier
+	CompressedSize   uint32   // Compressed size (0 if not compressed)
+	IsGzipCompressed bool     // Whether data is GZIP compressed
 }
 
 // CreateAlbumArtStartPayload creates album art start payload
@@ -319,9 +347,11 @@ func CreateAlbumArtStartPayload(checksum [32]byte, totalChunks, imageSize uint32
 	return payload
 }
 
-// ParseAlbumArtStartPayload parses album art start payload
+// ParseAlbumArtStartPayload parses album art start payload with backward compatibility
 func ParseAlbumArtStartPayload(payload []byte) (*AlbumArtStartPayload, error) {
-	if len(payload) < 40 {
+	// Support both old format (40+ bytes) and new format with compression (45+ bytes)
+	minSize := 40
+	if len(payload) < minSize {
 		return nil, fmt.Errorf("album art start payload too short: %d bytes", len(payload))
 	}
 	
@@ -329,7 +359,23 @@ func ParseAlbumArtStartPayload(payload []byte) (*AlbumArtStartPayload, error) {
 	copy(result.Checksum[:], payload[0:32])
 	result.TotalChunks = binary.BigEndian.Uint32(payload[32:36])
 	result.ImageSize = binary.BigEndian.Uint32(payload[36:40])
-	result.TrackID = string(payload[40:])
+	
+	// Check if this is the new format with compression info
+	if len(payload) >= 45 {
+		// New format with compression support
+		result.CompressedSize = binary.BigEndian.Uint32(payload[40:44])
+		compressionFlags := payload[44]
+		result.IsGzipCompressed = (compressionFlags & 0x01) != 0
+		result.TrackID = string(payload[45:])
+		
+		log.Printf("🎨 Received compressed album art: original=%d bytes, compressed=%d bytes, gzip=%v", 
+			result.ImageSize, result.CompressedSize, result.IsGzipCompressed)
+	} else {
+		// Old format - no compression info
+		result.CompressedSize = 0
+		result.IsGzipCompressed = false
+		result.TrackID = string(payload[40:])
+	}
 	
 	return result, nil
 }
@@ -450,6 +496,84 @@ func CreateCapabilitiesPayload(version string, features []string, mtu int, debug
 	return payload
 }
 
+// ParseFullStatePayload parses a FullState message payload from NocturneCompanion
+func ParseFullStatePayload(payload []byte) (*MediaState, error) {
+	if len(payload) < 24 { // Minimum size updated for hash: 1+8+8+1+4+2+0+2+0+2+0 = 30, but we check 24 for safety
+		return nil, fmt.Errorf("full state payload too short: %d bytes", len(payload))
+	}
+	
+	offset := 0
+	
+	// State flags (1 byte)
+	flags := payload[offset]
+	isPlaying := (flags & 0x01) != 0
+	offset++
+	
+	// Timing (16 bytes)
+	durationMs := int64(binary.BigEndian.Uint64(payload[offset : offset+8]))
+	offset += 8
+	positionMs := int64(binary.BigEndian.Uint64(payload[offset : offset+8]))
+	offset += 8
+	
+	// Volume (1 byte)
+	volume := int(payload[offset])
+	offset++
+	
+	// Album hash (4 bytes)
+	albumHash := int32(binary.BigEndian.Uint32(payload[offset : offset+4]))
+	offset += 4
+	
+	// Artist string (2 bytes length + data)
+	if offset+2 > len(payload) {
+		return nil, fmt.Errorf("payload truncated while reading artist length")
+	}
+	artistLen := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
+	offset += 2
+	
+	if offset+artistLen > len(payload) {
+		return nil, fmt.Errorf("payload truncated while reading artist data")
+	}
+	artist := string(payload[offset : offset+artistLen])
+	offset += artistLen
+	
+	// Album string (2 bytes length + data)
+	if offset+2 > len(payload) {
+		return nil, fmt.Errorf("payload truncated while reading album length")
+	}
+	albumLen := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
+	offset += 2
+	
+	if offset+albumLen > len(payload) {
+		return nil, fmt.Errorf("payload truncated while reading album data")
+	}
+	album := string(payload[offset : offset+albumLen])
+	offset += albumLen
+	
+	// Track string (2 bytes length + data)
+	if offset+2 > len(payload) {
+		return nil, fmt.Errorf("payload truncated while reading track length")
+	}
+	trackLen := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
+	offset += 2
+	
+	if offset+trackLen > len(payload) {
+		return nil, fmt.Errorf("payload truncated while reading track data")
+	}
+	track := string(payload[offset : offset+trackLen])
+	
+	return &MediaState{
+		Artist:     artist,
+		Album:      album,
+		Track:      track,
+		DurationMs: durationMs,
+		PositionMs: positionMs,
+		IsPlaying:  isPlaying,
+		Volume:     volume,
+		AlbumHash:  albumHash,
+		LastUpdate: time.Now(),
+	}, nil
+}
+
 // GetMessageTypeString returns human-readable string for message type
 func GetMessageTypeString(msgType uint16) string {
 	switch msgType {
@@ -512,6 +636,10 @@ func GetMessageTypeString(msgType uint16) string {
 		return "AlbumArtEnd"
 	case MSG_ALBUM_ART_NOT_AVAILABLE:
 		return "AlbumArtNotAvailable"
+	case MSG_ALBUM_ART_AVAILABLE_QUERY:
+		return "AlbumArtAvailabilityQuery"
+	case MSG_ALBUM_ART_NEEDED_RESPONSE:
+		return "AlbumArtNeededResponse"
 	
 	// Test album art messages
 	case MSG_TEST_ALBUM_ART_START:
@@ -569,4 +697,84 @@ func EncodeAlbumArtStart(totalChunks uint16, albumArtHash string) []byte {
 func EncodeAlbumArtChunk(chunkIndex uint16, chunkData []byte) []byte {
 	payload := CreateAlbumArtChunkPayload(uint32(chunkIndex), chunkData)
 	return EncodeMessage(MSG_ALBUM_ART_CHUNK, payload, 0)
+}
+
+// Album art availability query payload structures
+type AlbumArtAvailabilityQuery struct {
+	Checksum         string
+	TrackID          string
+	CompressedSize   uint32
+	IsGzipCompressed bool
+}
+
+// ParseAlbumArtAvailabilityQuery parses an album art availability query payload
+func ParseAlbumArtAvailabilityQuery(payload []byte) (*AlbumArtAvailabilityQuery, error) {
+	if len(payload) < 8 {
+		return nil, fmt.Errorf("album art availability query payload too short: %d bytes", len(payload))
+	}
+	
+	offset := 0
+	
+	// Read checksum length and checksum
+	checksumLength := int(payload[offset])
+	offset++
+	if len(payload) < offset+checksumLength {
+		return nil, fmt.Errorf("insufficient data for checksum")
+	}
+	checksum := string(payload[offset : offset+checksumLength])
+	offset += checksumLength
+	
+	// Read track ID length and track ID
+	if len(payload) < offset+2 {
+		return nil, fmt.Errorf("insufficient data for track ID length")
+	}
+	trackIDLength := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
+	offset += 2
+	if len(payload) < offset+trackIDLength {
+		return nil, fmt.Errorf("insufficient data for track ID")
+	}
+	trackID := string(payload[offset : offset+trackIDLength])
+	offset += trackIDLength
+	
+	// Read compression info
+	if len(payload) < offset+5 {
+		return nil, fmt.Errorf("insufficient data for compression info")
+	}
+	compressedSize := binary.BigEndian.Uint32(payload[offset : offset+4])
+	offset += 4
+	compressionFlags := payload[offset]
+	isGzipCompressed := (compressionFlags & 0x01) != 0
+	
+	return &AlbumArtAvailabilityQuery{
+		Checksum:         checksum,
+		TrackID:          trackID,
+		CompressedSize:   compressedSize,
+		IsGzipCompressed: isGzipCompressed,
+	}, nil
+}
+
+// CreateAlbumArtNeededResponse creates a simple y/n response for album art availability
+func CreateAlbumArtNeededResponse(needed bool) []byte {
+	if needed {
+		return []byte{'y'}
+	} else {
+		return []byte{'n'}
+	}
+}
+
+// ParseAlbumArtNeededResponse parses a y/n response
+func ParseAlbumArtNeededResponse(payload []byte) (bool, error) {
+	if len(payload) == 0 {
+		return false, fmt.Errorf("empty response payload")
+	}
+	
+	response := payload[0]
+	switch response {
+	case 'y', 'Y':
+		return true, nil
+	case 'n', 'N':
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid response: %c", response)
+	}
 }

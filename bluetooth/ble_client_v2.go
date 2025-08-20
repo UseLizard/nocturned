@@ -1,8 +1,10 @@
 package bluetooth
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -14,22 +16,24 @@ import (
 
 // BleClientV2 is the v2 implementation of the BLE client compatible with NocturneCompanion.
 type BleClientV2 struct {
-	conn            *dbus.Conn
-	wsHub           *utils.WebSocketHub
-	broadcaster     *utils.WebSocketBroadcaster
-	weatherHandler  *WeatherHandler
-	mu              sync.RWMutex
-	stopChan        chan struct{}
-	devicePath      dbus.ObjectPath
-	commandRxChar   dbus.BusObject // Write - for receiving commands from companion
-	stateTxChar     dbus.BusObject // Notify - for sending state updates to companion
-	debugLogChar    dbus.BusObject // Notify - for debug logs
-	deviceInfoChar  dbus.BusObject // Read - for device info
-	albumArtTxChar  dbus.BusObject // Notify - for album art transfer
-	isConnected     bool
-	commandQueue    chan *Command
-	nextMessageID   uint16
-	commandHandler  *CommandHandler
+	conn                *dbus.Conn
+	wsHub               *utils.WebSocketHub
+	broadcaster         *utils.WebSocketBroadcaster
+	weatherHandler      *WeatherHandler
+	albumArtHandler     *AlbumArtHandler // Reference to the album art handler
+	mediaStateCallback  func(*MediaState)
+	mu                  sync.RWMutex
+	stopChan            chan struct{}
+	devicePath          dbus.ObjectPath
+	commandRxChar       dbus.BusObject // Write - for receiving commands from companion
+	stateTxChar         dbus.BusObject // Notify - for sending state updates to companion
+	debugLogChar        dbus.BusObject // Notify - for debug logs
+	deviceInfoChar      dbus.BusObject // Read - for device info
+	albumArtTxChar      dbus.BusObject // Notify - for album art transfer
+	isConnected         bool
+	commandQueue        chan *Command
+	nextMessageID       uint16
+	commandHandler      *CommandHandler
 }
 
 // NewBleClientV2 creates a new BleClientV2 instance.
@@ -50,6 +54,45 @@ func NewBleClientV2(conn *dbus.Conn, wsHub *utils.WebSocketHub) *BleClientV2 {
 	client.commandHandler = NewCommandHandler(wsHub, client.sendMessage)
 	
 	return client
+}
+
+// SetMediaStateCallback sets the callback for media state updates
+func (c *BleClientV2) SetMediaStateCallback(callback func(*MediaState)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mediaStateCallback = callback
+}
+
+// SendPlayCommand sends a play command to the companion
+func (c *BleClientV2) SendPlayCommand() error {
+	return c.sendMessage(MSG_CMD_PLAY, []byte{})
+}
+
+// SendPauseCommand sends a pause command to the companion
+func (c *BleClientV2) SendPauseCommand() error {
+	return c.sendMessage(MSG_CMD_PAUSE, []byte{})
+}
+
+// SendNextCommand sends a next track command to the companion
+func (c *BleClientV2) SendNextCommand() error {
+	return c.sendMessage(MSG_CMD_NEXT, []byte{})
+}
+
+// SendPreviousCommand sends a previous track command to the companion
+func (c *BleClientV2) SendPreviousCommand() error {
+	return c.sendMessage(MSG_CMD_PREVIOUS, []byte{})
+}
+
+// SendVolumeCommand sends a volume command to the companion
+func (c *BleClientV2) SendVolumeCommand(volumePercent int) error {
+	payload := CreateCommandPayload(nil, &volumePercent)
+	return c.sendMessage(MSG_CMD_SET_VOLUME, payload)
+}
+
+// SendSeekCommand sends a seek command to the companion
+func (c *BleClientV2) SendSeekCommand(positionMs int64) error {
+	payload := CreateCommandPayload(&positionMs, nil)
+	return c.sendMessage(MSG_CMD_SEEK_TO, payload)
 }
 
 // getNextMessageID returns the next message ID for request/response correlation
@@ -127,9 +170,9 @@ func (c *BleClientV2) run() {
 					continue
 				}
 				
-				log.Printf("DEBUG: Connection healthy, sleeping 5 seconds")
+				log.Printf("DEBUG: Connection healthy, sleeping 15 seconds")
 				// Sleep to avoid tight loop when connected
-				time.Sleep(5 * time.Second)
+				time.Sleep(15 * time.Second)
 			}
 		}
 	}
@@ -460,13 +503,16 @@ func (c *BleClientV2) handleNotifications() {
 			// Check if this is a GATT characteristic property change
 			if len(sig.Body) >= 1 {
 				if interfaceName, ok := sig.Body[0].(string); ok && interfaceName == "org.bluez.GattCharacteristic1" {
-					// Check if this signal is from our STATE_TX characteristic (where we receive commands)
+					// Check if this signal is from our STATE_TX or ALBUM_ART_TX characteristic
 					charPath := string(sig.Path)
 					isOurCharacteristic := false
 					
 					if c.stateTxChar != nil && string(c.stateTxChar.Path()) == charPath {
 						isOurCharacteristic = true
 						log.Printf("📨 Received data on STATE_TX characteristic")
+					} else if c.albumArtTxChar != nil && string(c.albumArtTxChar.Path()) == charPath {
+						isOurCharacteristic = true
+						log.Printf("📨 Received data on ALBUM_ART_TX characteristic")
 					}
 					
 					if !isOurCharacteristic {
@@ -478,6 +524,14 @@ func (c *BleClientV2) handleNotifications() {
 							if valueVariant, exists := changedProps["Value"]; exists {
 								if value, ok := valueVariant.Value().([]byte); ok {
 									log.Printf("📨 Received notification from %s: %d bytes", charPath, len(value))
+									
+									// Debug: Log first 16 bytes for header analysis
+									if len(value) >= 16 {
+										log.Printf("📨 First 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+											value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+											value[8], value[9], value[10], value[11], value[12], value[13], value[14], value[15])
+									}
+									
 									c.handleNotification(value)
 								}
 							}
@@ -490,6 +544,13 @@ func (c *BleClientV2) handleNotifications() {
 }
 
 func (c *BleClientV2) handleNotification(data []byte) {
+	// Check if this is a JSON message (starts with '{')
+	if len(data) > 0 && data[0] == '{' {
+		log.Printf("📨 Received JSON message instead of binary protocol: %s", string(data))
+		c.handleJSONNotification(data)
+		return
+	}
+
 	if len(data) < HEADER_SIZE {
 		log.Printf("Received invalid notification data: too short (%d bytes)", len(data))
 		return
@@ -545,13 +606,37 @@ func (c *BleClientV2) handleNotification(data []byte) {
 		
 	// State messages (0x02xx) - media state from companion
 	case MSG_STATE_FULL:
-		// Forward state updates to WebSocket clients using broadcaster
+		// Parse the FullState payload
+		if mediaState, err := ParseFullStatePayload(payload); err != nil {
+			log.Printf("❌ Failed to parse FullState payload: %v", err)
+		} else {
+			// Update manager state through callback
+			c.mu.RLock()
+			callback := c.mediaStateCallback
+			c.mu.RUnlock()
+			
+			if callback != nil {
+				callback(mediaState)
+			}
+		}
+		
+		// Continue to forward state updates to WebSocket clients using broadcaster
 		c.broadcaster.BroadcastMediaStateUpdate(payload)
 		
 	// Album art messages (0x03xx) - album art data from companion
-	case MSG_ALBUM_ART_START, MSG_ALBUM_ART_CHUNK, MSG_ALBUM_ART_END:
-		// Forward album art updates to WebSocket clients using broadcaster
-		c.broadcaster.BroadcastAlbumArtUpdate(messageType, payload)
+	case MSG_ALBUM_ART_START:
+		c.handleAlbumArtStart(payload)
+		// Broadcast start event (but not the raw data)
+		c.broadcaster.BroadcastAlbumArtUpdate(messageType, nil)
+	case MSG_ALBUM_ART_CHUNK:
+		c.handleAlbumArtChunk(uint16(messageID), payload)
+		// Don't broadcast individual chunks to avoid overwhelming WebSocket
+	case MSG_ALBUM_ART_END:
+		c.handleAlbumArtEnd(payload)
+		// Broadcast completion event (but not the raw data)
+		c.broadcaster.BroadcastAlbumArtUpdate(messageType, nil)
+	case MSG_ALBUM_ART_AVAILABLE_QUERY:
+		c.handleAlbumArtAvailabilityQuery(payload)
 		
 	// Weather messages (0x05xx) - Extended protocol from NocturneCompanion
 	case MSG_WEATHER_START:
@@ -642,9 +727,108 @@ func (c *BleClientV2) sendAlbumArt(trackID string, data []byte) error {
 	return nil
 }
 
+// handleAlbumArtStart handles album art start messages
+func (c *BleClientV2) handleAlbumArtStart(payload []byte) {
+	startPayload, err := ParseAlbumArtStartPayload(payload)
+	if err != nil {
+		log.Printf("Failed to parse album art start payload: %v", err)
+		return
+	}
+	
+	// Convert checksum to hex string
+	hash := fmt.Sprintf("%x", startPayload.Checksum)
+	
+	log.Printf("🎨 Starting album art transfer: hash=%s, chunks=%d, size=%d", 
+		hash, startPayload.TotalChunks, startPayload.ImageSize)
+	
+	// Start the transfer in the album art handler with compression support
+	if c.albumArtHandler != nil {
+		if startPayload.IsGzipCompressed && startPayload.CompressedSize > 0 {
+			err := c.albumArtHandler.StartTransferWithCompression(
+				hash, 
+				int(startPayload.TotalChunks), 
+				int(startPayload.ImageSize),
+				int(startPayload.CompressedSize),
+				startPayload.IsGzipCompressed,
+			)
+			if err != nil {
+				log.Printf("Failed to start compressed album art transfer: %v", err)
+			}
+		} else {
+			err := c.albumArtHandler.StartTransfer(hash, int(startPayload.TotalChunks), int(startPayload.ImageSize))
+			if err != nil {
+				log.Printf("Failed to start album art transfer: %v", err)
+			}
+		}
+	}
+}
 
+// handleAlbumArtChunk handles album art chunk messages
+func (c *BleClientV2) handleAlbumArtChunk(chunkIndex uint16, payload []byte) {
+	log.Printf("🎨 Received album art chunk %d (%d bytes)", chunkIndex, len(payload))
+	
+	// Handle the album art chunk
+	if c.albumArtHandler != nil {
+		activeTransfers := c.albumArtHandler.GetActiveTransfers()
+		
+		// Find the active transfer (assuming only one at a time for simplicity)
+		for hash, _ := range activeTransfers {
+			err := c.albumArtHandler.ReceiveChunk(hash, int(chunkIndex), payload)
+			if err != nil {
+				log.Printf("Failed to receive album art chunk: %v", err)
+			}
+			break
+		}
+	}
+}
 
+// handleAlbumArtEnd handles album art end messages
+func (c *BleClientV2) handleAlbumArtEnd(payload []byte) {
+	endPayload, err := ParseAlbumArtEndPayload(payload)
+	if err != nil {
+		log.Printf("Failed to parse album art end payload: %v", err)
+		return
+	}
+	
+	// Convert checksum to hex string
+	hash := fmt.Sprintf("%x", endPayload.Checksum)
+	
+	log.Printf("🎨 Album art transfer ended: hash=%s, success=%t", hash, endPayload.Success)
+	
+	// The album art handler will automatically complete the transfer when all chunks are received
+}
 
+// handleAlbumArtAvailabilityQuery handles album art availability queries from companion
+func (c *BleClientV2) handleAlbumArtAvailabilityQuery(payload []byte) {
+	queryData, err := ParseAlbumArtAvailabilityQuery(payload)
+	if err != nil {
+		log.Printf("❌ Failed to parse album art availability query: %v", err)
+		return
+	}
+	
+	log.Printf("🎨 Album art availability query: checksum=%s, trackID=%s, compressed=%v, size=%d", 
+		queryData.Checksum, queryData.TrackID, queryData.IsGzipCompressed, queryData.CompressedSize)
+	
+	// Check if album art file exists locally
+	albumArtPath := fmt.Sprintf("/var/album_art/%s.webp", queryData.Checksum)
+	needed := true
+	
+	if _, err := os.Stat(albumArtPath); err == nil {
+		log.Printf("🎨 Album art already exists at %s - not needed", albumArtPath)
+		needed = false
+	} else {
+		log.Printf("🎨 Album art not found at %s - needed", albumArtPath)
+	}
+	
+	// Send y/n response
+	responsePayload := CreateAlbumArtNeededResponse(needed)
+	if err := c.sendMessage(MSG_ALBUM_ART_NEEDED_RESPONSE, responsePayload); err != nil {
+		log.Printf("❌ Failed to send album art needed response: %v", err)
+		return
+	}
+	
+	log.Printf("📤 Sent album art needed response: %s", string(responsePayload))
+}
 
 func (c *BleClientV2) getManagedObjects() (map[dbus.ObjectPath]map[string]map[string]dbus.Variant, error) {
 	obj := c.conn.Object(BLUEZ_BUS_NAME, "/")
@@ -654,4 +838,40 @@ func (c *BleClientV2) getManagedObjects() (map[dbus.ObjectPath]map[string]map[st
 		return nil, fmt.Errorf("failed to get managed objects: %w", err)
 	}
 	return managedObjects, nil
+}
+
+// handleJSONNotification handles JSON messages from companion (legacy/fallback)
+func (c *BleClientV2) handleJSONNotification(data []byte) {
+	var jsonMsg map[string]interface{}
+	if err := json.Unmarshal(data, &jsonMsg); err != nil {
+		log.Printf("❌ Failed to parse JSON notification: %v", err)
+		return
+	}
+	
+	msgType, ok := jsonMsg["type"].(string)
+	if !ok {
+		log.Printf("❌ JSON message missing 'type' field")
+		return
+	}
+	
+	log.Printf("📨 Processing JSON message type: %s", msgType)
+	
+	switch msgType {
+	case "album_art_not_available":
+		// Handle album art not available response
+		trackID, _ := jsonMsg["track_id"].(string)
+		reason, _ := jsonMsg["reason"].(string)
+		log.Printf("🎨 Album art not available for track %s: %s", trackID, reason)
+		
+		// This means the companion doesn't have the requested album art
+		// We could implement retry logic or fallback behavior here
+		
+	case "album_art_error":
+		// Handle album art error response
+		reason, _ := jsonMsg["reason"].(string)
+		log.Printf("🎨 Album art error: %s", reason)
+		
+	default:
+		log.Printf("📨 Unhandled JSON message type: %s", msgType)
+	}
 }

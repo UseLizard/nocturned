@@ -117,6 +117,19 @@ type DeviceInfoMessage struct {
 	HardwareVersion  string
 }
 
+// MediaState represents the current media playback state from FullState messages
+type MediaState struct {
+	Artist       string    `json:"artist"`
+	Album        string    `json:"album"`
+	Track        string    `json:"track"`
+	DurationMs   int64     `json:"duration_ms"`
+	PositionMs   int64     `json:"position_ms"`
+	IsPlaying    bool      `json:"is_playing"`
+	Volume       int       `json:"volume_percent"`
+	AlbumHash    int32     `json:"album_hash"`
+	LastUpdate   time.Time `json:"last_update"`
+}
+
 // ConnectionStatusMessage represents connection status
 type ConnectionStatusMessage struct {
 	Status        byte   // ConnectionState constants
@@ -146,16 +159,18 @@ type DeviceCapabilities struct {
 
 // AlbumArtTransfer represents an ongoing album art transfer
 type AlbumArtTransfer struct {
-	Hash         string
-	Data         []byte
-	Chunks       map[int][]byte
-	TotalChunks  int
-	Size         int
-	Checksum     string
-	StartTime    time.Time
-	LastUpdate   time.Time
-	IsComplete   bool
-	IsReceiving  bool
+	Hash             string
+	Data             []byte
+	Chunks           map[int][]byte
+	TotalChunks      int
+	Size             int               // Original uncompressed size
+	CompressedSize   int               // Compressed size (0 if not compressed)
+	IsGzipCompressed bool              // Whether data is GZIP compressed
+	Checksum         string
+	StartTime        time.Time
+	LastUpdate       time.Time
+	IsComplete       bool
+	IsReceiving      bool
 }
 
 // WeatherTransfer represents an ongoing weather data transfer
@@ -183,13 +198,13 @@ func DefaultRateLimitConfig() *RateLimitConfig {
 	return &RateLimitConfig{
 		MaxCommandsPerSecond: 10,
 		BurstSize:           5,
-		ChunkDelay:          50 * time.Millisecond,
+		ChunkDelay:          10 * time.Millisecond, // Aggressive: 5x faster than original 50ms
 	}
 }
 
 // ChunkSize constants
 const (
-	DefaultChunkSize = 400 // bytes
+	DefaultChunkSize = 512 // bytes - maximum MTU for aggressive optimization
 	MaxChunkSize     = 512 // bytes
 	MinChunkSize     = 64  // bytes
 )

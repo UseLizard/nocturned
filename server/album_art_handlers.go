@@ -1,15 +1,18 @@
 package server
 
 import (
-	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
+
+	"github.com/usenocturne/nocturned/utils"
 )
 
 // AlbumArtRequest represents an album art upload request
@@ -52,18 +55,13 @@ func (s *ServerV2) handleAlbumArtJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	// Validate hash if provided
-	if req.Hash != "" {
-		actualHash := fmt.Sprintf("%x", md5.Sum(data))
-		if actualHash != req.Hash {
-			writeErrorResponse(w, http.StatusBadRequest, 
-				fmt.Sprintf("Hash mismatch: expected %s, got %s", req.Hash, actualHash), nil)
-			return
-		}
-	} else {
-		// Generate hash if not provided
-		req.Hash = fmt.Sprintf("%x", md5.Sum(data))
+	// Hash is required and should be the integer hash from companion
+	if req.Hash == "" {
+		writeErrorResponse(w, http.StatusBadRequest, "Hash is required (should be integer hash from companion)", nil)
+		return
 	}
+	
+	// No hash validation - we trust the companion-provided hash
 	
 	// Send album art to device
 	if err := s.manager.SendAlbumArt(req.Hash, data); err != nil {
@@ -126,18 +124,13 @@ func (s *ServerV2) handleAlbumArtMultipart(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	
-	// Generate hash if not provided
+	// Hash is required and should be the integer hash from companion
 	if hash == "" {
-		hash = fmt.Sprintf("%x", md5.Sum(data))
-	} else {
-		// Validate provided hash
-		actualHash := fmt.Sprintf("%x", md5.Sum(data))
-		if actualHash != hash {
-			writeErrorResponse(w, http.StatusBadRequest, 
-				fmt.Sprintf("Hash mismatch: expected %s, got %s", hash, actualHash), nil)
-			return
-		}
+		writeErrorResponse(w, http.StatusBadRequest, "Hash is required (should be integer hash from companion)", nil)
+		return
 	}
+	
+	// No hash validation - we trust the companion-provided hash
 	
 	// Send album art to device
 	if err := s.manager.SendAlbumArt(hash, data); err != nil {
@@ -310,5 +303,187 @@ func (s *ServerV2) handleAlbumArtByHash(w http.ResponseWriter, r *http.Request) 
 	// Write image data
 	if _, err := w.Write(data); err != nil {
 		log.Printf("Failed to write album art data: %v", err)
+	}
+}
+
+// handleLatestAlbum handles requests for the latest saved album art
+func (s *ServerV2) handleLatestAlbum(w http.ResponseWriter, r *http.Request) {
+	albumArtDir := "/var/album_art"
+	
+	// Check if directory exists
+	if _, err := os.Stat(albumArtDir); os.IsNotExist(err) {
+		writeErrorResponse(w, http.StatusNotFound, "Album art directory not found", nil)
+		return
+	}
+	
+	// Read directory contents
+	files, err := os.ReadDir(albumArtDir)
+	if err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, "Failed to read album art directory", err)
+		return
+	}
+	
+	// Filter and sort files by modification time
+	type fileInfo struct {
+		name    string
+		modTime time.Time
+		size    int64
+	}
+	
+	var albumFiles []fileInfo
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		
+		// Get full file info
+		fullPath := filepath.Join(albumArtDir, file.Name())
+		stat, err := os.Stat(fullPath)
+		if err != nil {
+			continue
+		}
+		
+		// Skip empty files
+		if stat.Size() == 0 {
+			continue
+		}
+		
+		albumFiles = append(albumFiles, fileInfo{
+			name:    file.Name(),
+			modTime: stat.ModTime(),
+			size:    stat.Size(),
+		})
+	}
+	
+	// Check if any files found
+	if len(albumFiles) == 0 {
+		writeErrorResponse(w, http.StatusNotFound, "No album art files found", nil)
+		return
+	}
+	
+	// Sort by modification time (newest first)
+	sort.Slice(albumFiles, func(i, j int) bool {
+		return albumFiles[i].modTime.After(albumFiles[j].modTime)
+	})
+	
+	// Get the latest file
+	latestFile := albumFiles[0]
+	latestPath := filepath.Join(albumArtDir, latestFile.name)
+	
+	// Read the file
+	data, err := os.ReadFile(latestPath)
+	if err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, "Failed to read latest album art file", err)
+		return
+	}
+	
+	// Determine content type from file extension or data
+	contentType := "application/octet-stream"
+	ext := filepath.Ext(latestFile.name)
+	
+	switch ext {
+	case ".webp":
+		contentType = "image/webp"
+	case ".jpg", ".jpeg":
+		contentType = "image/jpeg"
+	case ".png":
+		contentType = "image/png"
+	default:
+		// Try to detect from data
+		if len(data) >= 4 {
+			if data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 {
+				contentType = "image/webp"
+			} else if data[0] == 0xFF && data[1] == 0xD8 {
+				contentType = "image/jpeg"
+			} else if data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
+				contentType = "image/png"
+			}
+		}
+	}
+	
+	// Set headers
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(latestFile.size, 10))
+	w.Header().Set("Cache-Control", "public, max-age=60") // Cache for 1 minute
+	w.Header().Set("X-Album-Art-Hash", filepath.Base(latestFile.name)) // Include hash in header
+	w.Header().Set("X-Album-Art-Modified", latestFile.modTime.Format(time.RFC3339))
+	
+	log.Printf("Serving latest album art: %s (%d bytes, %s)", 
+		latestFile.name, latestFile.size, latestFile.modTime.Format("2006-01-02 15:04:05"))
+	
+	// Write image data
+	if _, err := w.Write(data); err != nil {
+		log.Printf("Failed to write latest album art data: %v", err)
+	}
+}
+
+// handleCurrentAlbumArt handles requests for the current album art
+func (s *ServerV2) handleCurrentAlbumArt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		writeErrorResponse(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+
+	// Get current album art from global storage
+	data := utils.GetCurrentAlbumArt()
+	
+	if data == nil {
+		writeErrorResponse(w, http.StatusNotFound, "No current album art available", nil)
+		return
+	}
+	
+	// Determine content type from data
+	contentType := "application/octet-stream"
+	if len(data) >= 4 {
+		if data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 {
+			contentType = "image/webp"
+		} else if data[0] == 0xFF && data[1] == 0xD8 {
+			contentType = "image/jpeg"
+		} else if data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
+			contentType = "image/png"
+		}
+	}
+	
+	// Set headers
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "public, max-age=60") // Cache for 1 minute
+	
+	log.Printf("Serving current album art: %d bytes (%s)", len(data), contentType)
+	
+	// Write image data
+	if _, err := w.Write(data); err != nil {
+		log.Printf("Failed to write current album art data: %v", err)
+	}
+}
+
+// handleAlbumArtEnabled handles getting and setting album art transfer enabled state
+func (s *ServerV2) handleAlbumArtEnabled(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		enabled := s.manager.IsAlbumArtEnabled()
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"enabled":   enabled,
+			"timestamp": time.Now().Unix(),
+		})
+		
+	case "POST":
+		var request struct {
+			Enabled bool `json:"enabled"`
+		}
+		
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeErrorResponse(w, http.StatusBadRequest, "Invalid JSON in request body", err)
+			return
+		}
+		
+		s.manager.SetAlbumArtEnabled(request.Enabled)
+		
+		log.Printf("Album art transfers %s via API", map[bool]string{true: "enabled", false: "disabled"}[request.Enabled])
+		
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"enabled":   request.Enabled,
+			"timestamp": time.Now().Unix(),
+		})
 	}
 }

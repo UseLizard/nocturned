@@ -59,6 +59,7 @@ func (s *ServerV2) Start(port int) error {
 	mux.HandleFunc("/api/v2/media/album-art", s.methodHandler("POST", s.handleAlbumArt))
 	mux.HandleFunc("/api/v2/media/album-art/status", s.methodHandler("GET", s.handleAlbumArtStatus))
 	mux.HandleFunc("/api/v2/media/album-art/cache", s.multiMethodHandler([]string{"GET", "DELETE"}, s.handleAlbumArtCache))
+	mux.HandleFunc("/api/v2/media/album-art/enabled", s.multiMethodHandler([]string{"GET", "POST"}, s.handleAlbumArtEnabled))
 	mux.HandleFunc("/api/v2/media/album-art/", s.handleAlbumArtByHashRoute)
 	
 	// Weather
@@ -67,7 +68,7 @@ func (s *ServerV2) Start(port int) error {
 	
 	// V1 compatibility routes (for nocturne-ui compatibility)
 	mux.HandleFunc("/bluetooth/status", s.methodHandler("GET", s.handleBluetoothStatus))
-	mux.HandleFunc("/media/status", s.methodHandler("GET", s.handleCurrentMedia))
+	mux.HandleFunc("/media/status", s.methodHandler("GET", s.handleV1MediaStatus))
 	mux.HandleFunc("/media/play", s.methodHandler("POST", s.handleV1MediaPlay))
 	mux.HandleFunc("/media/pause", s.methodHandler("POST", s.handleV1MediaPause))
 	mux.HandleFunc("/media/next", s.methodHandler("POST", s.handleV1MediaNext))
@@ -78,6 +79,7 @@ func (s *ServerV2) Start(port int) error {
 	mux.HandleFunc("/device/date", s.methodHandler("GET", s.handleV1Date))
 	mux.HandleFunc("/device/date/settimezone", s.methodHandler("POST", s.handleV1DateTimezone))
 	mux.HandleFunc("/api/weather/current", s.methodHandler("GET", s.handleCurrentWeather)) // V1 weather compatibility
+	mux.HandleFunc("/api/albumart", s.methodHandler("GET", s.handleLegacyAlbumArt)) // V1 album art compatibility
 	
 	// Apply middleware to most routes
 	handler := loggingMiddleware(corsMiddleware(mux))
@@ -88,8 +90,15 @@ func (s *ServerV2) Start(port int) error {
 	// WebSocket endpoint - handled directly without middleware
 	mainMux.HandleFunc("/ws", s.handleWebSocketDirect)
 	
+	// Latest album endpoint - handled directly
+	mainMux.HandleFunc("/latestalbum", s.handleLatestAlbum)
+	
+	// Current album art endpoint - handled directly
+	mainMux.HandleFunc("/api/v2/album-art/current", s.handleCurrentAlbumArt)
+	
 	// All other routes through middleware
-	mainMux.Handle("/", handler)
+	mainMux.HandleFunc("/", s.handleIndex)
+	mainMux.Handle("/api/", handler)
 
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
@@ -106,6 +115,8 @@ func (s *ServerV2) Start(port int) error {
 	log.Printf("HTTP_SRV:   GET  /api/v2/bluetooth/status")
 	log.Printf("HTTP_SRV:   POST /api/v2/media/play-state")
 	log.Printf("HTTP_SRV:   POST /api/v2/media/album-art")
+	log.Printf("HTTP_SRV:   GET  /api/v2/album-art/current")
+	log.Printf("HTTP_SRV:   GET  / (Index)")
 	log.Printf("HTTP_SRV:   GET  /ws (WebSocket)")
 	
 	return s.server.ListenAndServe()
@@ -212,18 +223,25 @@ func (s *ServerV2) handleVolume(w http.ResponseWriter, r *http.Request) {
 
 // handleCurrentMedia returns current media state
 func (s *ServerV2) handleCurrentMedia(w http.ResponseWriter, r *http.Request) {
-	state := s.manager.GetCurrentState()
+	mediaState := s.manager.GetCurrentMediaState()
 	
 	response := map[string]interface{}{
 		"timestamp": time.Now().Unix(),
+		"connected": mediaState != nil,
 	}
 	
-	if playState, exists := state["play_state"]; exists {
-		response["play_state"] = playState
-	}
-	
-	if volume, exists := state["volume"]; exists {
-		response["volume"] = volume
+	if mediaState != nil {
+		response["state"] = map[string]interface{}{
+			"artist":        mediaState.Artist,
+			"album":         mediaState.Album,
+			"track":         mediaState.Track,
+			"duration_ms":   mediaState.DurationMs,
+			"position_ms":   mediaState.PositionMs,
+			"is_playing":    mediaState.IsPlaying,
+			"volume_percent": mediaState.Volume,
+			"album_hash":    mediaState.AlbumHash,
+			"last_update":   mediaState.LastUpdate.Unix(),
+		}
 	}
 	
 	writeJSONResponse(w, http.StatusOK, response)
@@ -310,17 +328,31 @@ func (s *ServerV2) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.wsHub.RemoveClient(conn)
 	}()
 	
-	// Set up ping/pong handling
+	// Set up ping/pong handling with proper timeouts
+	const (
+		writeWait  = 10 * time.Second
+		pongWait   = 60 * time.Second
+		pingPeriod = 54 * time.Second // 9/10 of pongWait
+	)
+	
+	// Set initial read deadline
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+	
 	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
 	})
 	
 	// Keep connection alive with ping/pong
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
+	
+	// Channel to signal connection close
+	done := make(chan struct{})
 	
 	// Listen for close messages and pings
 	go func() {
+		defer close(done)
 		for {
 			_, _, err := conn.ReadMessage()
 			if err != nil {
@@ -334,7 +366,10 @@ func (s *ServerV2) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	
 	for {
 		select {
+		case <-done:
+			return
 		case <-ticker.C:
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				log.Printf("HTTP_SRV: WebSocket ping failed: %v", err)
 				return
@@ -497,17 +532,31 @@ func (s *ServerV2) handleWebSocketDirect(w http.ResponseWriter, r *http.Request)
 		s.wsHub.RemoveClient(conn)
 	}()
 	
-	// Set up ping/pong handling
+	// Set up ping/pong handling with proper timeouts
+	const (
+		writeWait  = 10 * time.Second
+		pongWait   = 60 * time.Second
+		pingPeriod = 54 * time.Second // 9/10 of pongWait
+	)
+	
+	// Set initial read deadline
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+	
 	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
 	})
 	
 	// Keep connection alive with ping/pong
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
+	
+	// Channel to signal connection close
+	done := make(chan struct{})
 	
 	// Listen for close messages and pings
 	go func() {
+		defer close(done)
 		for {
 			_, _, err := conn.ReadMessage()
 			if err != nil {
@@ -521,11 +570,114 @@ func (s *ServerV2) handleWebSocketDirect(w http.ResponseWriter, r *http.Request)
 	
 	for {
 		select {
+		case <-done:
+			return
 		case <-ticker.C:
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				log.Printf("HTTP_SRV: WebSocket ping failed: %v", err)
 				return
 			}
 		}
 	}
+}
+
+func (s *ServerV2) handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.WriteHeader(http.StatusOK)
+	html := `
+<!DOCTYPE html>
+<html>
+<head>
+<title>Nocturned API</title>
+<style>
+  body { font-family: sans-serif; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+  th { background-color: #f2f2f2; }
+</style>
+</head>
+<body>
+<h1>Nocturned API Endpoints</h1>
+<table>
+  <tr>
+    <th>Method</th>
+    <th>Path</th>
+    <th>Description</th>
+  </tr>
+  <tr>
+    <td>GET</td>
+    <td>/api/v2/status</td>
+    <td>Returns the overall system status.</td>
+  </tr>
+  <tr>
+    <td>GET</td>
+    <td>/api/v2/health</td>
+    <td>Returns health check information.</td>
+  </tr>
+  <tr>
+    <td>GET</td>
+    <td>/api/v2/bluetooth/status</td>
+    <td>Returns Bluetooth connection status.</td>
+  </tr>
+  <tr>
+    <td>GET</td>
+    <td>/api/v2/bluetooth/stats</td>
+    <td>Returns detailed Bluetooth statistics.</td>
+  </tr>
+  <tr>
+    <td>POST</td>
+    <td>/api/v2/media/play-state</td>
+    <td>Handles play state updates.</td>
+  </tr>
+  <tr>
+    <td>POST</td>
+    <td>/api/v2/media/volume</td>
+    <td>Handles volume updates.</td>
+  </tr>
+  <tr>
+    <td>GET</td>
+    <td>/api/v2/media/current</td>
+    <td>Returns current media state.</td>
+  </tr>
+  <tr>
+    <td>POST</td>
+    <td>/api/v2/media/album-art</td>
+    <td>Handles album art updates.</td>
+  </tr>
+  <tr>
+    <td>GET</td>
+    <td>/api/v2/media/album-art/status</td>
+    <td>Returns the status of album art processing.</td>
+  </tr>
+  <tr>
+    <td>GET/DELETE</td>
+    <td>/api/v2/media/album-art/cache</td>
+    <td>Gets or clears the album art cache.</td>
+  </tr>
+  <tr>
+    <td>GET</td>
+    <td>/api/v2/media/album-art/:hash</td>
+    <td>Returns album art by hash.</td>
+  </tr>
+  <tr>
+    <td>POST</td>
+    <td>/api/v2/weather</td>
+    <td>Handles weather updates.</td>
+  </tr>
+  <tr>
+    <td>GET</td>
+    <td>/api/v2/weather/current</td>
+    <td>Returns current weather state.</td>
+  </tr>
+  <tr>
+    <td>GET</td>
+    <td>/ws</td>
+    <td>WebSocket connection for real-time updates.</td>
+  </tr>
+</table>
+</body>
+</html>
+`
+	w.Write([]byte(html))
 }
